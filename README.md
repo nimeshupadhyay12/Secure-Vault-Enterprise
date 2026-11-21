@@ -183,23 +183,25 @@ This diagram describes the guarded encrypted-storage path. Encrypted routes are 
 Secure-Vault-Enterprise/
 ├── backend/
 │   ├── api_main.py                 # FastAPI application entry point
+│   ├── requirements.txt            # Pinned runtime and test dependencies
 │   ├── app/
 │   │   ├── api/                    # Authentication, documents, vault UI and APIs
 │   │   ├── core/                   # Core application configuration
 │   │   ├── database/               # SQLite access, repositories and migrations
 │   │   ├── security/               # JWT, password, encryption and key protection
 │   │   └── services/               # Document services
-│   └── tests/                      # Available focused test modules
+│   └── tests/                      # Isolated unit and integration tests
 ├── frontend/
 │   ├── index.html                  # Vault dashboard
 │   ├── vault.css                   # Dashboard styling
 │   └── vault.js                    # Dashboard interactions and API calls
+├── LICENSE
 └── README.md
 ~~~
 
 ## Run locally
 
-The repository currently does not include a pinned dependency manifest or a complete first-run provisioning script. The commands below install the main runtime dependencies in a Windows virtual environment; they are a development starting point, not a reproducible locked build.
+Dependencies are pinned in `backend/requirements.txt`. The commands below create a Windows virtual environment and install those pinned versions. A repeatable first-run database and account provisioning script is still recommended before real use.
 
 ### 1. Prerequisites
 
@@ -219,10 +221,10 @@ py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 ~~~
 
-### 3. Install the main dependencies
+### 3. Install the pinned dependencies
 
 ~~~powershell
-.\.venv\Scripts\python.exe -m pip install fastapi "uvicorn[standard]" cryptography PyJWT argon2-cffi pywin32 python-multipart httpx
+.\.venv\Scripts\python.exe -m pip install -r backend\requirements.txt
 ~~~
 
 ### 4. Set a development JWT secret
@@ -283,19 +285,26 @@ For exact request and response schemas, run the app locally and open `/docs`.
 
 ## Tests and current project status
 
-Focused test modules currently present in the repository:
+Test modules included in the repository:
 
 - `test_vault_ui.py`
 - `test_vault_lifecycle.py`
+- `test_jwt_encrypted_upload_integration.py` (disposable database, DPAPI KEK and fictional-user fixture)
 - `test_encrypted_download_router.py`
 - `test_fasttrack_acceptance.py`
 
-The two encrypted-download / acceptance modules import a shared fixture named `test_jwt_encrypted_upload_integration.py`, which is not currently included in this repository snapshot. Restore that fixture before treating those modules as runnable. The earlier full regression count is not claimed as verified by this repository snapshot.
+Run the suite from the repository root on Windows:
+
+~~~powershell
+.\.venv\Scripts\python.exe -m pytest backend/tests -q
+~~~
+
+All 23 tests pass on Python 3.12 with the pinned dependencies. The integration tests create a temporary SQLite database and a DPAPI-protected test key; they never touch the real vault.
 
 Before using the project beyond a local development environment:
 
-- Restore and run the complete regression suite.
-- Add a pinned dependency file and first-run database/account provisioning.
+- Keep the complete regression suite green before and after changes.
+- Add repeatable first-run database/account provisioning.
 - Review every route and deployment guard.
 - Add automated secret scanning and dependency/security checks.
 - Test backup, restore, key recovery, and failure cases using disposable data.
@@ -306,10 +315,10 @@ Before using the project beyond a local development environment:
 <details>
 <summary><strong>Current repository snapshot and honest status</strong></summary>
 
-- The repository includes the FastAPI application, API modules, security modules, SQLite repositories/migrations, frontend assets, and four focused test modules.
+- The repository includes the FastAPI application, API modules, security modules, SQLite repositories/migrations, frontend assets, and five test modules.
 - The encrypted upload feature is guarded and disabled by default.
-- Two test modules reference a shared fixture that is not present in this repository snapshot; restore that fixture before treating those modules as runnable.
-- The README's setup commands are a development starting point. A pinned dependency lockfile and complete first-run provisioning flow are still recommended.
+- The shared JWT integration fixture is included and the full suite passes locally on Windows.
+- Dependencies are pinned in `backend/requirements.txt`. A complete first-run provisioning flow is still recommended.
 - No production-readiness, compliance, or independent security-audit claim is made.
 
 </details>
@@ -318,9 +327,9 @@ Before using the project beyond a local development environment:
 
 The following are sensible next engineering milestones, not claims that they are already complete.
 
-- [ ] Add a pinned `requirements.txt` or lockfile and documented supported Python version.
+- [x] Add a pinned `requirements.txt` or lockfile and documented supported Python version.
 - [ ] Add a repeatable database migration and first-user provisioning command.
-- [ ] Restore the missing shared test fixture and make the complete test suite reproducible from a clean clone.
+- [x] Include the shared JWT integration fixture so the complete test suite runs from a clean clone.
 - [ ] Add CI to run tests, linting, dependency checks and secret scanning on each pull request.
 - [ ] Add automated tests for cross-user access denial and key-recovery failure cases.
 - [ ] Add backup/restore and key-rotation procedures with documented recovery drills.
@@ -405,6 +414,10 @@ Do not demonstrate with real personal or customer documents.
 This repository is for learning, demonstration, and local development. It has not been independently security-audited or certified for regulated or production workloads. Do not expose the development server to the public internet. Do not commit `.env` files, signing secrets, private keys, DPAPI-protected key files, SQLite databases, ciphertext, or real customer documents.
 
 Cryptographic primitives do not by themselves make an application production-secure. Production use would require threat modelling, hardened deployment, access-control review, key lifecycle and recovery procedures, logging controls, backups, monitoring, and independent security testing.
+
+## License
+
+Released under the [MIT License](LICENSE).
 
 ## Author
 
