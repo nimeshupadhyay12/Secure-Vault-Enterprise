@@ -51,9 +51,11 @@ def validate_upload(filename, content):
             "Only simple .txt filenames are allowed"
         )
 
-    base_name = filename.rsplit(".", 1)[0].upper()
+    # Windows ignores extensions when resolving device names, so
+    # "CON.backup.txt" still refers to the CON device.
+    device_name = filename.split(".", 1)[0].upper()
 
-    if base_name in WINDOWS_RESERVED_NAMES:
+    if device_name in WINDOWS_RESERVED_NAMES:
         raise ValueError("Reserved filename is not allowed")
 
     # STEP 3: Require actual byte content.
