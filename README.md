@@ -299,7 +299,7 @@ Run the suite from the repository root on Windows:
 .\.venv\Scripts\python.exe -m pytest backend/tests -q
 ~~~
 
-All 23 tests pass on Python 3.12 with the pinned dependencies. The integration tests create a temporary SQLite database and a DPAPI-protected test key; they never touch the real vault.
+All 40 tests pass on Python 3.12 with the pinned dependencies. The integration tests create a temporary SQLite database and a DPAPI-protected test key; they never touch the real vault.
 
 Before using the project beyond a local development environment:
 
