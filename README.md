@@ -29,7 +29,7 @@ SecureVault Enterprise is a FastAPI + SQLite document vault with a browser dashb
 |---|---|
 | Encryption at rest | AES-256-GCM, fresh 256-bit DEK and 96-bit nonce per document; DEK wrapped by the KEK (envelope encryption) |
 | Context binding | AAD binds every ciphertext and wrapped DEK to owner id, document id, storage id and filename, so swapped or re-assigned files fail to decrypt |
-| Integrity | SHA-256 recorded at upload, re-checked after decryption on every download path (`hmac.compare_digest`), returned as `X-Content-SHA256` and checked again in the browser |
+| Integrity | SHA-256 recorded at upload, re-checked after decryption on every download path (`hmac.compare_digest`), returned as `X-Content-SHA256` and checked again in the browser for encrypted-document downloads |
 | Key protection | Pluggable key provider: DPAPI (default on Windows, bound to the key id) or AES-GCM master key (`SECUREVAULT_MASTER_KEY`) |
 | Key rotation | `manage rotate-kek` re-wraps every DEK under a new KEK without touching any ciphertext file |
 | Documents | `.txt`, `.pdf`, `.docx`, `.xlsx`, `.png`, `.jpg/.jpeg` up to 5 MiB, with structural type checks and zip-bomb limits |
@@ -93,7 +93,7 @@ Directories are restricted to the current account (protected DACL with only the 
 ## Architecture
 
 ```
-Browser (frontend/vault.js)        tokens in memory only; verifies X-Content-SHA256
+Browser (frontend/vault.js)        tokens in memory only; verifies X-Content-SHA256 (encrypted-document downloads)
         │  same origin
         ▼
 FastAPI app (backend/api_main.py → create_app)
@@ -129,18 +129,18 @@ DEK (256-bit, one per document) → stored wrapped (48 bytes) in encrypted_docum
 Ciphertext file <random 128-bit storage id>.svenc = nonce(12) ‖ ciphertext ‖ tag(16)
 ```
 
-* **Nonces:** 96-bit random values; every DEK encrypts exactly one plaintext and every wrap uses a fresh nonce, so a (key, nonce) pair is never reused.
+* **Nonces:** 96-bit random values; every DEK encrypts exactly one plaintext and every wrap uses a fresh random nonce, so (key, nonce) reuse is avoided by design for DEKs and is negligibly unlikely for the KEK (random 96-bit nonces).
 * **AAD (document path):** JSON `["SecureVault-L47-v1", kind, owner_id, document_id, storage_id, filename]` with `kind` = `file` for the content and `key` for the wrapped DEK. Binary vault: `["SV-BINARY-1", owner, file_id, storage_id, filename]` plus `|file` / `|key`. Moving a ciphertext to another row, owner, id or filename makes GCM authentication fail. (Consequence: renaming an encrypted document is refused with 409.)
 * **KEK at rest:** DPAPI blobs use optional entropy `SecureVault-KEK-v2:<key_id>`, so a renamed key file is useless; legacy files without entropy are still read. The master-key provider stores `SVK1 ‖ nonce ‖ AES-GCM(KEK)` with AAD `securevault-kek-v1:<key_id>`.
 * **Integrity:** the plaintext SHA-256 is stored with the wrapped DEK (`content_sha256`, migration 004) and in the metadata. After decryption it is compared in constant time; a GCM failure or a mismatch returns `500 Document failed integrity verification` and writes an `integrity_failure` audit event. Rows written before migration 004 still decrypt and get their fingerprint recorded on the first GCM-authenticated read.
-* **Rotation:** `rotate-kek` unwraps each DEK with the KEK named in its row and re-wraps it under the new KEK in one transaction; ciphertext files are not touched. The old KEK file is kept for older backups.
+* **Rotation:** `rotate-kek` unwraps each DEK with the KEK named in its row and re-wraps it under the new KEK in one transaction per database; ciphertext files are not touched. The old KEK file is kept for older backups.
 
 ## Authentication design
 
 * **Passwords:** Argon2id, `t=3, m=64 MiB, p=4, hash_len=32, salt_len=16` (RFC 9106 second profile, above the OWASP minimum of m=19 MiB, t=2, p=1), pinned in code and visible in the encoded hash (`$argon2id$v=19$m=65536,t=3,p=4$…`). Weaker stored hashes are upgraded on the next successful login (`check_needs_rehash`). New passwords: 12–1024 characters, small blocklist, must not contain the username (NIST SP 800-63B style).
 * **Access token:** HS256 JWT, 15 minutes, claims `sub, iss, aud, iat, nbf, exp, jti, typ=access` all required; `algorithms=["HS256"]` is pinned so `alg:none` and algorithm confusion are rejected. The secret must be 32+ characters; documented/placeholder values are refused unless `SECUREVAULT_ENV=development`, which instead uses a random per-process secret (no hard-coded default exists).
 * **Refresh token:** 256-bit opaque value; only its SHA-256 is stored. Each `/auth/refresh` marks the token used and issues a new one in the same family (2 h idle, 12 h absolute). Presenting a used or revoked token revokes the whole family (reuse detection).
-* **Logout / revocation:** `/auth/logout` stores the access token's `jti` until it expires (checked on every request) and revokes the refresh family, or all of the user's sessions with `all_sessions: true`.
+* **Logout / revocation:** `/auth/logout` stores the access token's `jti` until it expires (checked on every request) and revokes the refresh family, or every refresh family of the user with `all_sessions: true`. Access tokens already issued to other devices are not revoked and stay valid until they expire (at most 15 minutes).
 * **Lockout and enumeration:** 5 failures within 15 minutes lock that username for 15 minutes (429 + `Retry-After`), whether or not it exists. Unknown usernames still run one Argon2 verification, so response time does not reveal valid accounts. Failures, lockouts, refreshes, reuse and logouts are audited.
 * **Browser:** tokens live only in a JavaScript closure (never localStorage); one shared refresh runs on a 401 and the request is retried once.
 
@@ -148,11 +148,11 @@ Ciphertext file <random 128-bit storage id>.svenc = nonce(12) ‖ ciphertext ‖
 
 | Threat | Mitigation |
 |---|---|
-| Stolen disk, backup or copied vault folder | Only ciphertext and wrapped DEKs on disk; the KEK is DPAPI-protected (needs the Windows user's credentials) or needs the external master key |
+| Stolen disk, backup or copied vault folder | Documents are stored only as ciphertext with wrapped DEKs; the KEK is DPAPI-protected (needs the Windows user's credentials) or needs the external master key. Note: `runtime/securevault.env` holds the JWT secret and audit HMAC key (and the master key with `--dev-master-key`), so protect the runtime folder and keep backups of it separate |
 | Attacker edits, swaps or truncates ciphertext / key rows | AES-GCM tags + AAD binding + SHA-256 re-check; failure is reported and audited, never returned as data |
 | Another user tries to read or change a document | Every query filters by the authenticated owner; foreign ids answer 404 |
 | Password guessing / credential stuffing | Argon2id, lockout, uniform responses and timing |
-| Stolen access token | 15-minute lifetime, revocable via logout |
+| Stolen access token | 15-minute lifetime; the token used to log out is revoked immediately, other sessions' access tokens expire within 15 minutes |
 | Stolen refresh token | Rotation; reuse revokes the family for attacker and victim |
 | Forged JWT | Pinned algorithm, required claims, audience/issuer/type checks, strong secret |
 | Misconfigured deployment (broad key ACLs, wrong account, nested dirs) | Startup guards refuse to enable encrypted storage and explain why |
