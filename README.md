@@ -2,20 +2,16 @@
 
 <h1 align="center"><img src="docs/assets/securevault-logo.png" width="68" alt="SecureVault shield logo" />&nbsp; SecureVault Enterprise</h1>
 
-### A Windows-first document vault with authenticated APIs and guarded encrypted storage.
+### An encrypted document vault: data-at-rest protection with strong, owner-scoped access control.
 
-[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![CI](https://github.com/nimeshupadhyay12/Secure-Vault-Enterprise/actions/workflows/ci.yml/badge.svg)](https://github.com/nimeshupadhyay12/Secure-Vault-Enterprise/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-API-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 [![SQLite](https://img.shields.io/badge/SQLite-Database-003B57?logo=sqlite&logoColor=white)](https://www.sqlite.org/)
-[![JavaScript](https://img.shields.io/badge/JavaScript-Vanilla-F7DF1E?logo=javascript&logoColor=222)](https://developer.mozilla.org/en-US/docs/Web/JavaScript)
-[![Windows](https://img.shields.io/badge/Windows-First-0078D4?logo=windows&logoColor=white)](https://www.microsoft.com/windows)
-[![Cryptography](https://img.shields.io/badge/Cryptography-AES--GCM-6C43A3?logo=letsencrypt&logoColor=white)](https://cryptography.io/)
-[![JWT](https://img.shields.io/badge/Auth-JWT-000000?logo=jsonwebtokens&logoColor=white)](https://jwt.io/)
-[![Status](https://img.shields.io/badge/Status-Development-orange)](#project-status)
+[![Cryptography](https://img.shields.io/badge/AES--256--GCM-envelope_encryption-6C43A3)](https://cryptography.io/)
+[![Windows DPAPI](https://img.shields.io/badge/Windows-DPAPI-0078D4?logo=windows&logoColor=white)](https://learn.microsoft.com/windows/win32/api/dpapi/)
 
-**[Repository](https://github.com/nimeshupadhyay12/Secure-Vault-Enterprise) · [Features](#feature-tour) · [Architecture](#architecture) · [Setup](#run-locally) · [Security](#security-model) · [Screenshots](#screenshots)**
-
-<img src="https://img.shields.io/badge/BUILT_WITH-Python_%7C_FastAPI_%7C_Cryptography-202A44?style=for-the-badge" alt="Built with Python, FastAPI and cryptography" />
+**[Features](#features) · [Quick start](#quick-start) · [Crypto design](#cryptographic-design) · [Auth design](#authentication-design) · [Threat model](#threat-model) · [API](#api) · [Configuration](#configuration) · [Tests](#tests-and-ci)**
 
 </div>
 
@@ -23,416 +19,283 @@
 
 ## Overview
 
-SecureVault Enterprise is a local-first document-management project built around a Python/FastAPI backend, a browser-based dashboard, and security controls for authentication, document ownership, file integrity, and encrypted storage.
+SecureVault Enterprise is a FastAPI + SQLite document vault with a browser dashboard. Every document is encrypted with its own AES-256-GCM data key; data keys are wrapped by a key-encryption key (KEK) that never touches disk in the clear (Windows DPAPI by default, or an external master key on Linux/CI). Users sign in with Argon2id-hashed passwords and get 15-minute JWT access tokens plus rotating refresh tokens, and every document operation is scoped to its owner. Every download is re-verified against the SHA-256 recorded at upload, and security events go to a hash-chained, tamper-evident audit log.
 
-The project explores how a document vault can combine short-lived access tokens, authenticated encryption, protected key material, and owner-scoped API operations. Encrypted upload and download routes are deliberately **guarded and disabled by default**; they are registered only after explicit configuration and server-side preflight checks.
+> **Status:** local MVP built for learning and demonstration. It has not been independently penetration-tested or cryptographically reviewed. See the [threat model](#threat-model) and [limitations](#limitations).
 
-> **Project status:** Development / local MVP. This repository is not presented as a production-audited service. Review the configuration and limitations below before enabling encrypted storage or using real documents.
+## Features
 
-## Why this project?
-
-Sensitive documents need more than a file upload button. A document vault must authenticate users, enforce ownership, protect encryption keys, detect tampering, and fail safely when its storage prerequisites are missing.
-
-SecureVault Enterprise is a hands-on implementation project exploring those responsibilities together. It brings together backend API design, browser UI development, authentication, cryptographic building blocks, Windows-specific key protection, and database-backed document metadata.
-
-### At a glance
-
-| Focus | What the project demonstrates |
+| Area | What it does |
 |---|---|
-| 🔐 Identity | Password verification and short-lived JWT access tokens |
-| 🛡️ Access control | Authenticated, owner-scoped document operations |
-| 🔒 Confidentiality | AES-256-GCM encryption modules and key-wrapping logic |
-| 🧩 Key protection | Windows DPAPI-backed KEK storage |
-| 🧪 Integrity | SHA-256 fingerprints and authenticated-encryption checks |
-| 🗂️ Usability | Browser dashboard, document organization, search and filters |
-| ⚙️ Engineering | FastAPI routes, SQLite repositories, migrations and focused tests |
+| Encryption at rest | AES-256-GCM, fresh 256-bit DEK and 96-bit nonce per document; DEK wrapped by the KEK (envelope encryption) |
+| Context binding | AAD binds every ciphertext and wrapped DEK to owner id, document id, storage id and filename, so swapped or re-assigned files fail to decrypt |
+| Integrity | SHA-256 recorded at upload, re-checked after decryption on every download path (`hmac.compare_digest`), returned as `X-Content-SHA256` and checked again in the browser |
+| Key protection | Pluggable key provider: DPAPI (default on Windows, bound to the key id) or AES-GCM master key (`SECUREVAULT_MASTER_KEY`) |
+| Key rotation | `manage rotate-kek` re-wraps every DEK under a new KEK without touching any ciphertext file |
+| Documents | `.txt`, `.pdf`, `.docx`, `.xlsx`, `.png`, `.jpg/.jpeg` up to 5 MiB, with structural type checks and zip-bomb limits |
+| Authentication | Argon2id (pinned parameters, rehash on login), 15-min HS256 access JWT, refresh-token rotation with reuse detection, logout and revocation |
+| Brute force | Per-username lockout (429 + `Retry-After`) and a dummy Argon2 verify for unknown usernames (no timing oracle) |
+| Access control | Every document, organiser and binary-vault query is filtered by the authenticated owner; other users' items answer 404 |
+| Audit | Hash-chained (optionally HMAC-keyed) audit log of sign-ins, document changes, uploads/downloads and integrity failures; `manage audit-verify` |
+| Fail-safe startup | Encrypted storage starts only after key-file ACL, directory ACL, process identity, path topology, schema and key-recovery checks pass; otherwise the API refuses to start and says why |
+| HTTP hardening | CSP, nosniff, frame denial, no-referrer, no-store, optional HSTS, request-size cap, CORS off unless exact origins are configured |
+| Operations | `manage setup` (one command), `check`, `create-user`, `audit-verify`, `rotate-kek`; GitHub Actions on Windows and Ubuntu |
 
-### Contents
+## Quick start
 
-- [Feature tour](#feature-tour)
-- [Security model](#security-model)
-- [Architecture](#architecture)
-- [Technology stack](#technology-stack)
-- [Repository structure](#repository-structure)
-- [Run locally](#run-locally)
-- [Encrypted-storage configuration](#encrypted-storage-configuration)
-- [API overview](#api-overview)
-- [Tests and project status](#tests-and-current-project-status)
-- [Screenshots](#screenshots)
-- [Roadmap](#roadmap)
+Requires Python 3.12. Create the virtual environment **outside** the repository (or use the gitignored `.venv/`).
 
-## Feature tour
+### Windows (DPAPI key provider, the default)
 
-| Capability | Description | Implementation note |
-|---|---|---|
-| 🖥️ Vault dashboard | Browser-based interface for navigating document metadata | Served at `/vault` |
-| 👤 Authentication | Credential verification and JWT issuance | Argon2id hashes; 15-minute token lifetime |
-| 🧭 Authorization | User identity resolution and document ownership checks | Protected API routes |
-| 📁 Organization | Folder, tag, favorite, search and sorting workflows | Metadata-oriented operations |
-| 🔐 Authenticated encryption | AES-256-GCM file encryption primitives | Encryption and authentication are combined |
-| 🗝️ Key hierarchy | Data-key wrapping and protected KEK storage | Windows DPAPI-backed key store |
-| 🧾 Integrity checks | SHA-256 content fingerprints and validation helpers | Hashing is separate from encryption |
-| 📄 File validation | Structural checks for supported document/image formats | Not malware scanning |
-| 🚦 Safe activation | Preflight checks before encrypted routes are registered | Encrypted upload is disabled by default |
+```powershell
+git clone https://github.com/nimeshupadhyay12/Secure-Vault-Enterprise.git
+cd Secure-Vault-Enterprise
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r backend\requirements.txt
 
-> **Important distinction:** the repository contains security modules and guarded routes, but encrypted upload/download is not automatically enabled. Do not describe the application as offering active end-to-end encrypted uploads unless you have enabled the guarded path in a controlled environment and verified a complete round trip.
+python -m backend.manage setup              # dirs, DBs, migrations, DPAPI-protected KEK, runtime\securevault.env
+python -m backend.manage create-user alice  # password prompted (12+ characters)
+uvicorn backend.api_main:app --host 127.0.0.1 --port 8766
+```
 
-|
-|---|---|
-| Web dashboard | Browser UI served at `/vault`, with document metadata, search, sorting, folders, tags, favorites, and activity views |
-| Authentication | Username/password verification, Argon2id password hashing, and short-lived JWT Bearer tokens |
-| Authorization | Protected document routes resolve the authenticated identity and use owner-scoped database queries |
-| File encryption | AES-256-GCM encryption modules with authenticated associated data |
-| Key protection | Windows DPAPI protects a Key Encryption Key (KEK) for the current Windows user; key-wrapping code protects document keys |
-| Integrity metadata | SHA-256 fingerprints for document content and upload validation |
-| Data layer | SQLite repositories and migration modules for user and document metadata |
-| Upload safeguards | Filename, file-type, content, and size checks; encrypted upload activation includes configuration and key-recovery preflight |
-| Binary-file module | Guarded PDF, DOCX, XLSX, PNG, and JPEG handling with structural checks and a 5 MiB limit |
+Open <http://127.0.0.1:8766/vault> and sign in. API docs: <http://127.0.0.1:8766/docs>.
 
-### Security design highlights
+### Linux / macOS (master-key provider)
 
-- **Argon2id password hashing:** passwords are verified against stored hashes rather than stored as plaintext.
-- **JWT Bearer authentication:** tokens use HS256, include an issuer and expiry, and have a configured 15-minute lifetime.
-- **AES-256-GCM:** authenticated encryption detects changes to ciphertext, authentication tags, keys, or associated context.
-- **Owner-bound context:** encryption metadata can bind content to a document owner and filename or storage identifier.
-- **Windows DPAPI:** a 256-bit KEK is protected for the current Windows user. A protected key file is not a portable substitute for a secure key backup.
-- **SHA-256:** content fingerprints support integrity checking; a hash by itself is not encryption or proof of authenticity.
-- **Browser protections:** the dashboard keeps its access token in tab memory and UI responses set controls such as `Cache-Control: no-store`, `X-Content-Type-Options`, and a Content Security Policy.
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r backend/requirements.txt
+export SECUREVAULT_MASTER_KEY="$(python -c 'import base64,secrets;print(base64.b64encode(secrets.token_bytes(32)).decode())')"
+# keep this key in a secret manager / service environment, never next to the vault files
+python -m backend.manage setup
+python -m backend.manage create-user alice
+uvicorn backend.api_main:app --host 127.0.0.1 --port 8766
+```
 
-## Security model
+`setup` is idempotent: running it again verifies the existing KEK and never replaces keys or secrets. For a throw-away development setup on Linux, `setup --dev-master-key` stores a generated master key in the config file (development only).
 
-SecureVault is organized around several security boundaries. Each one addresses a different risk; no single control replaces the others.
+### What `setup` creates
 
-| Layer | Control | Security purpose |
-|---|---|---|
-| Credential storage | Argon2id password hashing | Makes offline password guessing more expensive than storing plaintext or a fast hash |
-| API authentication | Signed, expiring JWT Bearer tokens | Establishes the caller identity on protected requests |
-| Authorization | Owner-scoped repository queries | Prevents a user from accessing another user's document records through normal API paths |
-| File confidentiality | AES-256-GCM | Encrypts content and authenticates ciphertext |
-| Key protection | Key wrapping + Windows DPAPI | Separates document encryption keys from the protected KEK |
-| Integrity | SHA-256 and GCM authentication | Detects content changes; GCM also authenticates encrypted payloads |
-| Upload activation | Configuration and recovery preflight | Keeps encrypted routes unavailable if required storage/key prerequisites are absent |
-| Browser response handling | No-store and related response headers | Reduces caching and common browser-side exposure |
+```
+runtime/                        (gitignored)
+├── securevault.env             paths, random JWT secret, audit HMAC key, process SID/uid
+├── data/securevault.db         users, documents, wrapped DEKs, refresh tokens, revocations, lockouts, audit log
+├── data/vault_organization.db  folders / tags / favourites
+├── data/vault_binary.db        binary-vault metadata
+├── encrypted-files/*.svenc     document ciphertext       (restricted to the current account)
+├── binary-files/*.svbin        binary-vault ciphertext   (restricted to the current account)
+└── protected-keys/<id>.dpapi   KEK protected by DPAPI (or <id>.kek with the env provider)
+```
 
-### Simplified key hierarchy
-
-~~~mermaid
-flowchart TB
-    A[Windows user context] --> B[DPAPI-protected KEK]
-    B --> C[Wrap / unwrap document key]
-    C --> D[Document Encryption Key]
-    D --> E[AES-256-GCM]
-    E --> F[Encrypted document]
-    G[SHA-256 fingerprint] -. integrity metadata .-> F
-~~~
-
-**Security boundaries and limitations**
-
-- DPAPI protection is tied to the Windows user and machine context. Plan and test key recovery before moving data to another machine or account.
-- JWT signing secrets must be generated and stored outside source control.
-- SHA-256 alone does not authenticate a file. Use authenticated encryption or a trusted signature when authenticity is required.
-- File-extension and structural validation do not replace malware scanning or content-disarm-and-reconstruction.
-- The project has not undergone an independent penetration test or formal cryptographic review.
+Directories are restricted to the current account (protected DACL with only the user and SYSTEM on Windows, `0700` elsewhere) and `setup` finishes by running the same preflight the API runs at startup. `python -m backend.manage check` repeats that preflight at any time and prints the exact reason for a failure.
 
 ## Architecture
 
-The high-level authenticated document flow is:
+```
+Browser (frontend/vault.js)        tokens in memory only; verifies X-Content-SHA256
+        │  same origin
+        ▼
+FastAPI app (backend/api_main.py → create_app)
+  ├─ core/http_security.py         headers, CSP, request cap, CORS
+  ├─ api/auth.py                   /auth/token|refresh|logout|me → security/sessions.py, tokens.py, passwords.py
+  ├─ api/private_documents.py      metadata CRUD (owner-scoped)
+  ├─ security/encrypted_upload_router.py / encrypted_download_router.py   (only after preflight)
+  │     └─ practice_document_service.py  AES-GCM + AAD, SHA-256 verify
+  │           └─ windows_kek_store.py → key_provider.py (DPAPI | master key)
+  ├─ api/vault_binary.py           binary vault (only after preflight)
+  ├─ api/vault_organizer.py        folders/tags + activity feed from the audit log
+  └─ security/audit_log.py         hash-chained audit trail
+SQLite (main DB, organiser DB, binary DB) + ciphertext directories
+Startup guards: key_file_guard → acl_guard → identity_guard → deployment_guard → registration (schema + KEK recovery)
+Configuration: core/settings.py (env → runtime/securevault.env → defaults)
+Operations: backend/manage.py (setup, check, create-user, audit-verify, rotate-kek)
+```
 
-~~~mermaid
-flowchart TD
-    A[Browser dashboard] --> B[POST /auth/token]
-    B --> C[Verify password hash]
-    C --> D[Issue short-lived JWT]
-    D --> E[Protected API request with Bearer token]
-    E --> F[Verify token and resolve user]
-    F --> G[Check document ownership]
-    G --> H[(SQLite metadata)]
-    G --> I{Encrypted routes enabled?}
-    I -- No --> J[Encrypted storage remains unavailable]
-    I -- Yes, after preflight --> K[AES-256-GCM file encryption]
-    K --> L[Wrap document key with protected KEK]
-    L --> M[Ciphertext storage]
-    M --> N[Owner-checked download and authenticated decryption]
-~~~
+## Cryptographic design
 
-This diagram describes the guarded encrypted-storage path. Encrypted routes are not available in the default configuration.
+**Key hierarchy**
 
-### Request lifecycle
+```
+DPAPI (current Windows user)  or  SECUREVAULT_MASTER_KEY (AES-256-GCM)
+        │ protects
+        ▼
+KEK (256-bit, one per key id, protected-keys/<id>.dpapi|.kek)
+        │ wraps (AES-256-GCM, fresh 96-bit nonce, AAD)
+        ▼
+DEK (256-bit, one per document) → stored wrapped (48 bytes) in encrypted_document_keys / binary_documents
+        │ encrypts (AES-256-GCM, fresh 96-bit nonce, AAD)
+        ▼
+Ciphertext file <random 128-bit storage id>.svenc = nonce(12) ‖ ciphertext ‖ tag(16)
+```
 
-1. The browser submits credentials to the token endpoint.
-2. The API verifies the stored password hash and issues a short-lived JWT.
-3. The browser sends the token as a Bearer token on protected requests.
-4. The API validates the token and resolves the authenticated user.
-5. The repository operation is scoped to that user.
-6. If an encrypted route is requested, it is available only when its guarded registration checks have passed.
-7. On a valid encrypted-storage path, the document key is used for AES-GCM and key material is protected through the configured key hierarchy.
+* **Nonces:** 96-bit random values; every DEK encrypts exactly one plaintext and every wrap uses a fresh nonce, so a (key, nonce) pair is never reused.
+* **AAD (document path):** JSON `["SecureVault-L47-v1", kind, owner_id, document_id, storage_id, filename]` with `kind` = `file` for the content and `key` for the wrapped DEK. Binary vault: `["SV-BINARY-1", owner, file_id, storage_id, filename]` plus `|file` / `|key`. Moving a ciphertext to another row, owner, id or filename makes GCM authentication fail. (Consequence: renaming an encrypted document is refused with 409.)
+* **KEK at rest:** DPAPI blobs use optional entropy `SecureVault-KEK-v2:<key_id>`, so a renamed key file is useless; legacy files without entropy are still read. The master-key provider stores `SVK1 ‖ nonce ‖ AES-GCM(KEK)` with AAD `securevault-kek-v1:<key_id>`.
+* **Integrity:** the plaintext SHA-256 is stored with the wrapped DEK (`content_sha256`, migration 004) and in the metadata. After decryption it is compared in constant time; a GCM failure or a mismatch returns `500 Document failed integrity verification` and writes an `integrity_failure` audit event. Rows written before migration 004 still decrypt and get their fingerprint recorded on the first GCM-authenticated read.
+* **Rotation:** `rotate-kek` unwraps each DEK with the KEK named in its row and re-wraps it under the new KEK in one transaction; ciphertext files are not touched. The old KEK file is kept for older backups.
 
-## Technology stack
+## Authentication design
 
-- **Backend:** Python 3.10+, FastAPI, Pydantic
-- **Authentication:** PyJWT, Argon2
-- **Cryptography:** `cryptography` (AES-GCM), SHA-256, Windows DPAPI via `pywin32`
-- **Database:** SQLite
-- **Frontend:** HTML, CSS, vanilla JavaScript
-- **API style:** REST with JSON and Bearer-token authentication
-- **Development platform:** Windows 10/11
+* **Passwords:** Argon2id, `t=3, m=64 MiB, p=4, hash_len=32, salt_len=16` (RFC 9106 second profile, above the OWASP minimum of m=19 MiB, t=2, p=1), pinned in code and visible in the encoded hash (`$argon2id$v=19$m=65536,t=3,p=4$…`). Weaker stored hashes are upgraded on the next successful login (`check_needs_rehash`). New passwords: 12–1024 characters, small blocklist, must not contain the username (NIST SP 800-63B style).
+* **Access token:** HS256 JWT, 15 minutes, claims `sub, iss, aud, iat, nbf, exp, jti, typ=access` all required; `algorithms=["HS256"]` is pinned so `alg:none` and algorithm confusion are rejected. The secret must be 32+ characters; documented/placeholder values are refused unless `SECUREVAULT_ENV=development`, which instead uses a random per-process secret (no hard-coded default exists).
+* **Refresh token:** 256-bit opaque value; only its SHA-256 is stored. Each `/auth/refresh` marks the token used and issues a new one in the same family (2 h idle, 12 h absolute). Presenting a used or revoked token revokes the whole family (reuse detection).
+* **Logout / revocation:** `/auth/logout` stores the access token's `jti` until it expires (checked on every request) and revokes the refresh family, or all of the user's sessions with `all_sessions: true`.
+* **Lockout and enumeration:** 5 failures within 15 minutes lock that username for 15 minutes (429 + `Retry-After`), whether or not it exists. Unknown usernames still run one Argon2 verification, so response time does not reveal valid accounts. Failures, lockouts, refreshes, reuse and logouts are audited.
+* **Browser:** tokens live only in a JavaScript closure (never localStorage); one shared refresh runs on a 401 and the request is retried once.
+
+## Threat model
+
+| Threat | Mitigation |
+|---|---|
+| Stolen disk, backup or copied vault folder | Only ciphertext and wrapped DEKs on disk; the KEK is DPAPI-protected (needs the Windows user's credentials) or needs the external master key |
+| Attacker edits, swaps or truncates ciphertext / key rows | AES-GCM tags + AAD binding + SHA-256 re-check; failure is reported and audited, never returned as data |
+| Another user tries to read or change a document | Every query filters by the authenticated owner; foreign ids answer 404 |
+| Password guessing / credential stuffing | Argon2id, lockout, uniform responses and timing |
+| Stolen access token | 15-minute lifetime, revocable via logout |
+| Stolen refresh token | Rotation; reuse revokes the family for attacker and victim |
+| Forged JWT | Pinned algorithm, required claims, audience/issuer/type checks, strong secret |
+| Misconfigured deployment (broad key ACLs, wrong account, nested dirs) | Startup guards refuse to enable encrypted storage and explain why |
+| Malicious uploads | Allow-listed types, structural checks, zip-bomb limits, always served as `attachment` + `octet-stream` + nosniff |
+| Tampering with the audit trail | Hash chain (HMAC with `SECUREVAULT_AUDIT_KEY`), downgrade detection, `audit-verify` |
+
+**Out of scope:** malware running as the vault's Windows user (it can call DPAPI), a compromised server process or administrator, memory scraping, and network attackers when the API is exposed without TLS (put it behind HTTPS and set `SECUREVAULT_HSTS=1`).
+
+## API
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| GET | `/health` | none | Liveness |
+| GET | `/vault`, `/vault/assets/{file}`, `/vault/status` | none | Dashboard shell and capability flag |
+| POST | `/auth/token` | none | Username + password → access + refresh token |
+| POST | `/auth/login` | none | Deprecated alias of `/auth/token` (same code path) |
+| POST | `/auth/refresh` | refresh token | Rotate refresh token, new access token |
+| POST | `/auth/logout` | Bearer | Revoke this access token and a refresh family (or all sessions) |
+| GET | `/auth/me` | Bearer | Current identity |
+| POST | `/documents/encrypted?filename=` | Bearer | One-step encrypted upload (octet-stream body) |
+| POST | `/documents/{id}/encrypted-content?filename=` | Bearer, owner | Encrypt content for an existing metadata record |
+| GET | `/documents/{id}/encrypted-content` | Bearer, owner | Decrypt + verify; bytes and `X-Content-SHA256` |
+| GET / POST | `/documents/private` | Bearer | List (paginated) / create metadata |
+| GET / PATCH / DELETE | `/documents/private/{id}` | Bearer, owner | Read / rename (409 if encrypted) / delete metadata + ciphertext |
+| POST | `/documents/private/upload/check` | Bearer | Validate a text file without storing it |
+| GET / POST | `/vault/binary/files` | Bearer | Binary vault list / upload |
+| GET | `/vault/binary/files/{id}/download` | Bearer, owner | Decrypt + verify |
+| DELETE | `/vault/binary/files/{id}` | Bearer, owner | Delete |
+| GET | `/vault/organize/snapshot` | Bearer | Folders, tags, favourites, key-record flags |
+| PUT | `/vault/organize/documents/{id}` | Bearer, owner | Update folder / tags / favourite |
+| GET | `/vault/organize/activity` | Bearer | Caller's own audit-log entries |
+| any | `/documents/inspect`, `/documents/metadata*` | n/a | Retired, always 410 |
+
+Encrypted and binary routes are registered only when encrypted storage is enabled and the preflight passes.
+
+## Configuration
+
+Resolution order: environment variable → `runtime/securevault.env` (or `SECUREVAULT_CONFIG_FILE`) → default. `setup` writes the file; the authoritative list is `SETTINGS_REFERENCE` in `backend/app/core/settings.py`.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `SECUREVAULT_ENV` | `production` | `development` allows an ephemeral JWT secret and placeholder secrets |
+| `SECUREVAULT_CONFIG_FILE` | `runtime/securevault.env` | Config file location |
+| `SECUREVAULT_DB_PATH` | `backend/data/securevault.db` (`setup`: `runtime/data/`) | Main database |
+| `SECUREVAULT_ORG_DB_PATH` | `backend/data/vault_organization.db` | Organiser database |
+| `SECUREVAULT_BINARY_DB_PATH` | `backend/data/vault_binary.db` | Binary-vault database |
+| `SECUREVAULT_BINARY_STORAGE_DIR` | `../binary-files` (`setup`: `runtime/binary-files`) | Binary ciphertext directory |
+| `SECUREVAULT_JWT_SECRET` | none (required) | HS256 secret, 32+ characters |
+| `SECUREVAULT_KEY_PROVIDER` | `dpapi` on Windows, `env` elsewhere | KEK protection |
+| `SECUREVAULT_MASTER_KEY` | none | Base64 32-byte master key for the `env` provider |
+| `SECUREVAULT_AUDIT_KEY` | none (`setup` generates one) | HMAC key (32+ chars) for the audit chain |
+| `SECUREVAULT_ENABLE_ENCRYPTED_UPLOAD` | `0` | `1` enables encrypted storage after preflight |
+| `SECUREVAULT_UPLOAD_DB_PATH` | = `SECUREVAULT_DB_PATH` | Must equal the main DB if set |
+| `SECUREVAULT_UPLOAD_STORAGE_DIR` | none | Document ciphertext directory |
+| `SECUREVAULT_UPLOAD_KEK_DIR` | none | Protected KEK directory |
+| `SECUREVAULT_UPLOAD_KEK_ID` | none | Active KEK id |
+| `SECUREVAULT_UPLOAD_WINDOWS_SID` | none | Windows: SID the server must run as |
+| `SECUREVAULT_UPLOAD_EXPECTED_UID` | none | Linux/macOS: uid the server must run as |
+| `SECUREVAULT_MAX_DOCUMENT_BYTES` | `5242880` | Largest document (max 50 MiB) |
+| `SECUREVAULT_MAX_REQUEST_BYTES` | `6291456` | Request-body cap (keep above the document limit) |
+| `SECUREVAULT_LOGIN_MAX_FAILURES` | `5` | Failures before lockout |
+| `SECUREVAULT_LOGIN_WINDOW_SECONDS` | `900` | Failure counting window |
+| `SECUREVAULT_LOGIN_LOCKOUT_SECONDS` | `900` | Lockout duration |
+| `SECUREVAULT_CORS_ORIGINS` | empty | Exact allowed origins (comma-separated); `*` refused |
+| `SECUREVAULT_HSTS` | `0` | `1` sends Strict-Transport-Security |
+| `SECUREVAULT_ENABLE_DOCS` | `1` | `0` hides `/docs`, `/redoc`, `/openapi.json` |
+
+## Operator commands
+
+```bash
+python -m backend.manage setup [--runtime-dir DIR] [--key-id ID] [--provider dpapi|env] [--dev-master-key]
+python -m backend.manage check                       # startup preflight with reasons
+python -m backend.manage create-user USERNAME        # --password-stdin for automation
+python -m backend.manage audit-verify [--db PATH]    # exit 1 if the chain is broken
+python -m backend.manage rotate-kek --new-key-id ID  # stop the API first
+```
+
+## Tests and CI
+
+```powershell
+python -m pytest backend/tests -q
+```
+
+Current result on Windows 11 / Python 3.12 (real DPAPI):
+
+```
+129 passed, 1 skipped, 60 subtests passed
+```
+
+The skipped test checks POSIX permission bits and runs on Linux; on Linux the DPAPI-only test is skipped instead. Tests run in a temporary directory set up by `backend/tests/conftest.py` and never touch a real vault. They cover authentication (tokens, lockout, rotation, reuse, logout), Argon2 parameters and rehashing, key providers, settings, tamper detection on every download path, the audit chain, `setup`/`check`, startup guards, every supported file type end to end, owner scoping, the organiser, KEK rotation and HTTP hardening.
+
+GitHub Actions (`.github/workflows/ci.yml`) runs the full suite on `windows-latest` and the provider-independent suite on `ubuntu-latest`, then runs `setup`, `check`, an app import with encrypted storage enabled and `audit-verify` on both.
 
 ## Repository structure
 
-~~~text
-Secure-Vault-Enterprise/
-├── backend/
-│   ├── api_main.py                 # FastAPI application entry point
-│   ├── requirements.txt            # Pinned runtime and test dependencies
-│   ├── app/
-│   │   ├── api/                    # Authentication, documents, vault UI and APIs
-│   │   ├── core/                   # Core application configuration
-│   │   ├── database/               # SQLite access, repositories and migrations
-│   │   ├── security/               # JWT, password, encryption and key protection
-│   │   └── services/               # Document services
-│   └── tests/                      # Isolated unit and integration tests
-├── frontend/
-│   ├── index.html                  # Vault dashboard
-│   ├── vault.css                   # Dashboard styling
-│   └── vault.js                    # Dashboard interactions and API calls
-├── LICENSE
-└── README.md
-~~~
+```
+backend/
+├── api_main.py        create_app(): routers, guards, HTTP hardening
+├── manage.py          operator CLI
+├── app/core/          settings.py, bootstrap.py (setup/check), http_security.py
+├── app/api/           auth, private documents, binary vault, organiser, UI
+├── app/security/      crypto, key providers, sessions, tokens, passwords, audit log, guards, rotation
+├── app/database/      repositories and migrations 001-004
+└── tests/             isolated unit and integration tests
+frontend/              index.html, vault.css, vault.js
+docs/                  IMPROVEMENTS.md, screenshots, assets
+```
 
-## Run locally
+See [docs/IMPROVEMENTS.md](docs/IMPROVEMENTS.md) for every change made in the hardening pass and why.
 
-Dependencies are pinned in `backend/requirements.txt`. The commands below create a Windows virtual environment and install those pinned versions. A repeatable first-run database and account provisioning script is still recommended before real use.
+## Limitations
 
-### 1. Prerequisites
-
-- Windows 10 or Windows 11
-- Python 3.10 or later
-- PowerShell and Git
-
-Windows is required for the DPAPI-backed key-store implementation.
-
-### 2. Clone and create a virtual environment
-
-~~~powershell
-git clone https://github.com/nimeshupadhyay12/Secure-Vault-Enterprise.git
-cd Secure-Vault-Enterprise
-
-py -3 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-~~~
-
-### 3. Install the pinned dependencies
-
-~~~powershell
-.\.venv\Scripts\python.exe -m pip install -r backend\requirements.txt
-~~~
-
-### 4. Set a development JWT secret
-
-The token service requires `SECUREVAULT_JWT_SECRET` to contain at least 32 characters. Generate a fresh local value; do not commit or share it.
-
-~~~powershell
-$env:SECUREVAULT_JWT_SECRET = (& .\.venv\Scripts\python.exe -c "import secrets; print(secrets.token_urlsafe(48))")
-~~~
-
-### 5. Start the API
-
-~~~powershell
-.\.venv\Scripts\python.exe -m uvicorn backend.api_main:app --reload --host 127.0.0.1 --port 8766
-~~~
-
-Open these local addresses:
-
-- Dashboard: http://127.0.0.1:8766/vault
-- Health check: http://127.0.0.1:8766/health
-- Interactive API documentation: http://127.0.0.1:8766/docs
-
-**Account note:** the current API exposes token issuance and identity routes, but does not expose a public sign-up screen or public registration endpoint. A local account and the required document database schema must be provisioned before authenticated document operations can be exercised.
-
-## Encrypted-storage configuration
-
-Encrypted upload is **off by default**. Do not enable it against real data just to make the dashboard show an enabled status.
-
-The guarded activation path requires all of the following:
-
-1. `SECUREVAULT_ENABLE_ENCRYPTED_UPLOAD=1`
-2. `SECUREVAULT_UPLOAD_DB_PATH` — an existing SQLite database with the expected document and encrypted-key tables.
-3. `SECUREVAULT_UPLOAD_STORAGE_DIR` — an existing trusted ciphertext directory.
-4. `SECUREVAULT_UPLOAD_KEK_DIR` — an existing protected-key directory.
-5. `SECUREVAULT_UPLOAD_KEK_ID` — the identifier of an existing DPAPI-protected KEK that the current Windows user can recover.
-
-The application checks the paths, database schema, and protected key before registering encrypted routes. It does not create replacement keys or silently initialize encrypted storage during this preflight. Keep the ciphertext directory separate from the protected-key directory.
-
-The optional binary-document API has additional existing-storage and database prerequisites. Its file checks are structural validation, **not antivirus or malware scanning**.
-
-## API overview
-
-| Method | Endpoint | Purpose | Access |
-|---|---|---|---|
-| GET | `/health` | Application health response | Public |
-| POST | `/auth/token` | Verify credentials and issue a JWT | Credentials required |
-| GET | `/auth/me` | Return the authenticated account identity | Bearer token |
-| GET / POST | `/documents/private` | List owned document metadata / create a metadata record | Bearer token |
-| GET / PATCH / DELETE | `/documents/private/{document_id}` | Read, rename, or delete an owned document record | Bearer token |
-| POST | `/documents/private/upload/check` | Validate a text upload without storing it | Bearer token |
-| GET | `/vault` | Serve the browser dashboard | Public UI shell |
-| GET | `/vault/status` | Report whether guarded encrypted upload was registered | Public capability flag |
-| GET / PUT | `/vault/organize/...` | Read or update folder, tag, favorite, and activity metadata | Bearer token |
-| POST / GET | `/documents/{document_id}/encrypted-content` | Encrypted upload / download | Only when guarded registration succeeds |
-| POST / GET | `/vault/binary/...` | Optional encrypted binary-document operations | Conditional; requires its prerequisites |
-
-For exact request and response schemas, run the app locally and open `/docs`.
-
-## Tests and current project status
-
-Test modules included in the repository:
-
-- `test_vault_ui.py`
-- `test_vault_lifecycle.py`
-- `test_jwt_encrypted_upload_integration.py` (disposable database, DPAPI KEK and fictional-user fixture)
-- `test_encrypted_download_router.py`
-- `test_fasttrack_acceptance.py`
-
-Run the suite from the repository root on Windows:
-
-~~~powershell
-.\.venv\Scripts\python.exe -m pytest backend/tests -q
-~~~
-
-All 40 tests pass on Python 3.12 with the pinned dependencies. The integration tests create a temporary SQLite database and a DPAPI-protected test key; they never touch the real vault.
-
-Before using the project beyond a local development environment:
-
-- Keep the complete regression suite green before and after changes.
-- Add repeatable first-run database/account provisioning.
-- Review every route and deployment guard.
-- Add automated secret scanning and dependency/security checks.
-- Test backup, restore, key recovery, and failure cases using disposable data.
-- Complete a security review before enabling encrypted uploads.
-
-## Project status
-
-<details>
-<summary><strong>Current repository snapshot and honest status</strong></summary>
-
-- The repository includes the FastAPI application, API modules, security modules, SQLite repositories/migrations, frontend assets, and five test modules.
-- The encrypted upload feature is guarded and disabled by default.
-- The shared JWT integration fixture is included and the full suite passes locally on Windows.
-- Dependencies are pinned in `backend/requirements.txt`. A complete first-run provisioning flow is still recommended.
-- No production-readiness, compliance, or independent security-audit claim is made.
-
-</details>
-
-## Roadmap
-
-The following are sensible next engineering milestones, not claims that they are already complete.
-
-- [x] Add a pinned `requirements.txt` or lockfile and documented supported Python version.
-- [ ] Add a repeatable database migration and first-user provisioning command.
-- [x] Include the shared JWT integration fixture so the complete test suite runs from a clean clone.
-- [ ] Add CI to run tests, linting, dependency checks and secret scanning on each pull request.
-- [ ] Add automated tests for cross-user access denial and key-recovery failure cases.
-- [ ] Add backup/restore and key-rotation procedures with documented recovery drills.
-- [ ] Capture real dashboard screenshots and a short end-to-end demo using disposable sample data.
-- [ ] Complete an independent security review before any production deployment.
+* Single-process, local deployment; SQLite and file storage are not crash-atomic together (deletes use a reversible staging rename).
+* Lockout is per username, so an attacker can temporarily lock a known account (availability trade-off); there is no per-IP throttling.
+* The audit chain cannot detect truncation of the newest entries on its own; keep the head hash printed by `audit-verify` elsewhere.
+* File-type checks are structural, not malware scanning.
+* DPAPI ties the KEK to one Windows account and machine; plan key backup and recovery before storing real data.
 
 ## Screenshots
 
-Genuine captures from the configured local demo at [http://127.0.0.1:8766/vault](http://127.0.0.1:8766/vault). Localhost links work only on the computer running the project. The demo has encrypted storage enabled; the repository default remains disabled until its configuration and preflight checks pass.
+*Screenshots predate the hardening pass (wording on the upload and activity panels has changed).*
 
 ### Dashboard overview
-
-Authenticated workspace with document counts, listed file size, and storage status.
-
 ![SecureVault authenticated dashboard](docs/screenshots/03-dashboard.jpg)
 
 ### Document library and filters
-
-Document metadata, folder and favorite filters, filename search, sorting, and document actions.
-
 ![SecureVault document library and organization filters](docs/screenshots/04-document-library.jpg)
 
-### Encrypted text upload
-
-Text-file selection and the configured AES-GCM / DPAPI upload interface.
-
+### Encrypted upload
 ![SecureVault encrypted text upload interface](docs/screenshots/05-encrypted-upload.jpg)
 
 ### Binary-file vault
-
-The separate PDF, Word, Excel, and image upload interface, with an empty binary-file library.
-
 ![SecureVault binary-file vault](docs/screenshots/06-binary-files.jpg)
 
 ### Activity and security
-
-Recent demo events and current-tab feedback. This history is best effort and is not a tamper-proof compliance audit.
-
 ![SecureVault activity and security panel](docs/screenshots/07-activity-security.jpg)
 
 ### Sign-in
-
-Public workspace and account access, captured without credentials.
-
 ![SecureVault sign-in screen](docs/screenshots/01-sign-in.jpg)
 
 ### Interactive API documentation
-
-Swagger UI for the running demo API.
-
 ![SecureVault interactive API documentation](docs/screenshots/02-api-docs.jpg)
-
-**Screenshot safety:** use fictional test accounts and documents. Never include passwords, JWTs, API keys, DPAPI files, private keys, real personal documents, database contents, or sensitive filesystem paths.
-
-## Demo walkthrough checklist
-
-When preparing a portfolio demo, a useful 60–90 second walkthrough is:
-
-1. Open the vault dashboard and explain the main navigation.
-2. Show the document library using fictional sample records.
-3. Demonstrate search, sorting, tags, folders or favorites.
-4. Open the API documentation and identify the authentication and document routes.
-5. Explain the token → identity → ownership-check request path.
-6. Explain the guarded encrypted-storage design and why it is disabled by default in the checked-in configuration.
-
-Do not demonstrate with real personal or customer documents.
-
-## Engineering concepts demonstrated
-
-- REST API design and request validation
-- Authentication versus authorization
-- Password hashing and token-based sessions
-- Authenticated encryption and key hierarchy concepts
-- Windows-specific key protection with DPAPI
-- SQLite data access, repositories and schema migrations
-- Frontend-to-backend integration
-- Feature flags, startup preflight checks and fail-closed activation
-- Focused automated tests and regression-oriented development
-
-## Security and responsible use
-
-This repository is for learning, demonstration, and local development. It has not been independently security-audited or certified for regulated or production workloads. Do not expose the development server to the public internet. Do not commit `.env` files, signing secrets, private keys, DPAPI-protected key files, SQLite databases, ciphertext, or real customer documents.
-
-Cryptographic primitives do not by themselves make an application production-secure. Production use would require threat modelling, hardened deployment, access-control review, key lifecycle and recovery procedures, logging controls, backups, monitoring, and independent security testing.
 
 ## License
 
-Released under the [MIT License](LICENSE).
-
-## Author
-
-**Nimesh Upadhyay**
-
-- GitHub: [@nimeshupadhyay12](https://github.com/nimeshupadhyay12)
-- Project: [SecureVault Enterprise](https://github.com/nimeshupadhyay12/Secure-Vault-Enterprise)
-
-[![GitHub repository](https://img.shields.io/badge/GitHub-View_Repository-181717?logo=github&logoColor=white)](https://github.com/nimeshupadhyay12/Secure-Vault-Enterprise)
-[![Explore code](https://img.shields.io/badge/Explore-Source_Code-2563EB?style=flat&logo=github)](https://github.com/nimeshupadhyay12/Secure-Vault-Enterprise/tree/main)
-
----
-
-<div align="center">
-
-**SecureVault Enterprise** · Built to explore practical application security, encryption, and secure document workflows.
-
-</div>
+MIT, see [LICENSE](LICENSE).

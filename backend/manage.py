@@ -91,7 +91,8 @@ def cmd_create_user(args) -> int:
     from backend.app.database.user_repository import register_user
 
     if args.password_stdin:
-        password = sys.stdin.readline().rstrip("\r\n")
+        # Windows shells may prefix piped text with a byte-order mark.
+        password = sys.stdin.readline().lstrip("﻿").rstrip("\r\n")
     else:
         password = getpass.getpass("Password (12+ characters): ")
         if password != getpass.getpass("Repeat password: "):
