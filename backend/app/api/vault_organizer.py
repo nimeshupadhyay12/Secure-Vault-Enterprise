@@ -12,12 +12,20 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from backend.app.api.auth import get_current_user
+from backend.app.core import settings
 from backend.app.security.tokens import decode_access_token
 from backend.app.database.user_repository import get_user_by_id
 
-BACKEND = Path(__file__).resolve().parents[2]
-MAIN_DB = BACKEND / 'data' / 'securevault.db'
-SIDE_DB = BACKEND / 'data' / 'vault_organization.db'
+
+
+def _main_db():
+    return settings.db_path()
+
+
+def _side_db():
+    return settings.org_db_path()
+
+
 router = APIRouter(prefix='/vault/organize', tags=['Vault Organization'])
 NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9 _.-]{0,31}$')
 EVENTS = {'document_created', 'encrypted_uploaded', 'encrypted_downloaded', 'document_deleted', 'document_renamed', 'organization_updated'}
@@ -35,9 +43,9 @@ def _connect(path: Path, *, readonly=False):
     return connection
 
 
-def initialize_sidecar(path=SIDE_DB):
+def initialize_sidecar(path=None):
     """Explicit installer-only migration. Never run automatically on requests."""
-    path = Path(path)
+    path = Path(path) if path is not None else _side_db()
     if not path.is_file() or path.is_symlink():
         raise RuntimeError('Existing isolated organization database required')
     with closing(_connect(path)) as db, db:
@@ -67,7 +75,7 @@ def _owner(user):
 def _owned(document_id, owner_user_id):
     if type(document_id) is not int or document_id < 1:
         raise HTTPException(404, 'Document not found')
-    with closing(_connect(MAIN_DB, readonly=True)) as db:
+    with closing(_connect(_main_db(), readonly=True)) as db:
         record = db.execute('SELECT id,filename FROM owned_documents WHERE id=? AND owner_user_id=?', (document_id,owner_user_id)).fetchone()
     if record is None:
         raise HTTPException(404, 'Document not found')
@@ -77,7 +85,7 @@ def _owned(document_id, owner_user_id):
 def _insert_event(owner, event, document=None):
     if event not in EVENTS:
         raise ValueError('Invalid event type')
-    with closing(_connect(SIDE_DB)) as db, db:
+    with closing(_connect(_side_db())) as db, db:
         db.execute('INSERT INTO vault_events(owner_user_id,document_id,event_type,created_at) VALUES (?,?,?,?)',
                    (owner,document,event,datetime.now(timezone.utc).isoformat(timespec='seconds')))
         if event == 'document_deleted' and document is not None:
@@ -99,7 +107,7 @@ class OrganizationUpdate(BaseModel):
 @router.get('/snapshot')
 def snapshot(user=Depends(get_current_user)):
     owner = _owner(user)
-    with closing(_connect(MAIN_DB, readonly=True)) as db:
+    with closing(_connect(_main_db(), readonly=True)) as db:
         rows = db.execute('SELECT id FROM owned_documents WHERE owner_user_id=? ORDER BY id DESC LIMIT 500', (owner,)).fetchall()
         ids = [int(r['id']) for r in rows]
         has_keys = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='encrypted_document_keys'").fetchone() is not None
@@ -110,7 +118,7 @@ def snapshot(user=Depends(get_current_user)):
                 encrypted.add(row['document_id'])
     organized = {}
     if ids:
-        with closing(_connect(SIDE_DB, readonly=True)) as db:
+        with closing(_connect(_side_db(), readonly=True)) as db:
             for row in db.execute('SELECT document_id,folder,tags,favorite FROM document_organization WHERE document_id IN ('+','.join('?' for _ in ids)+')',ids):
                 try: tags = json.loads(row['tags'])
                 except (ValueError,TypeError): tags=[]
@@ -127,7 +135,7 @@ def save_organization(document_id: int, payload: OrganizationUpdate, user=Depend
     if len(payload.tags) > 8:
         raise HTTPException(422,'Maximum 8 tags')
     tags = list(dict.fromkeys(_validate_label(t) for t in payload.tags))
-    with closing(_connect(SIDE_DB)) as db, db:
+    with closing(_connect(_side_db())) as db, db:
         db.execute('''INSERT INTO document_organization(document_id,folder,tags,favorite,updated_at)
             VALUES (?,?,?,?,?) ON CONFLICT(document_id) DO UPDATE SET folder=excluded.folder,tags=excluded.tags,
             favorite=excluded.favorite,updated_at=excluded.updated_at''',
@@ -139,7 +147,7 @@ def save_organization(document_id: int, payload: OrganizationUpdate, user=Depend
 @router.get('/activity')
 def activity(limit:int=Query(30,ge=1,le=100), user=Depends(get_current_user)):
     owner = _owner(user)
-    with closing(_connect(SIDE_DB,readonly=True)) as db:
+    with closing(_connect(_side_db(),readonly=True)) as db:
         events = [dict(r) for r in db.execute('''SELECT id,document_id,event_type,created_at FROM vault_events
                    WHERE owner_user_id=? ORDER BY id DESC LIMIT ?''',(owner,limit))]
     return {'events':events, 'notice':'Best-effort local audit history; not tamper-resistant or compliance-grade'}

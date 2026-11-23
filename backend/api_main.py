@@ -1,44 +1,37 @@
-import os
+"""SecureVault Enterprise FastAPI application.
 
-from fastapi import FastAPI, Depends
+Run:  uvicorn backend.api_main:app --host 127.0.0.1 --port 8766
 
+All configuration comes from ``backend.app.core.settings`` (environment
+variables first, then ``runtime/securevault.env`` written by
+``python -m backend.manage setup``).
+"""
 
+from fastapi import Depends, FastAPI
 
-
+from backend.app.core import settings
 
 from backend.app.security.encrypted_upload_key_file_guard import (
     activate_encrypted_upload_with_key_file_guard
 )
 
-
-from backend.app.api.health import (
-    router as health_router
+from backend.app.api.health import router as health_router
+from backend.app.api.documents import router as documents_router
+from backend.app.api.document_metadata import router as metadata_router
+from backend.app.api.auth import router as auth_router
+from backend.app.api.private_documents import router as private_documents_router
+from backend.app.api.vault_ui import router as vault_ui_router
+from backend.app.api.vault_organizer import (
+    router as vault_organizer_router,
+    observe_actions as vault_observe_actions,
 )
 
-from backend.app.api.documents import (
-    router as documents_router
-)
-
-from backend.app.api.document_metadata import (
-    router as metadata_router
-)
-
-from backend.app.api.auth import (
-    router as auth_router
-)
-
-from backend.app.api.private_documents import (
-    router as private_documents_router
-)
-
-from backend.app.security.legacy_routes import (
-    reject_legacy_document_access
-)
+from backend.app.security.legacy_routes import reject_legacy_document_access
 
 
 app = FastAPI(
     title="SecureVault Enterprise API",
-    version="0.7.0"
+    version="0.8.0"
 )
 
 
@@ -46,7 +39,7 @@ app = FastAPI(
 app.include_router(health_router)
 
 
-# OLD DOCUMENT APIS — RETIRED
+# OLD DOCUMENT APIS - RETIRED
 # The dependency rejects every request with HTTP 410.
 # The routes are also hidden from Swagger.
 app.include_router(
@@ -65,41 +58,29 @@ app.include_router(
 # Authentication routes
 app.include_router(auth_router)
 
-
-# NEW JWT-PROTECTED DOCUMENT ROUTES
+# JWT-protected document metadata routes
 app.include_router(private_documents_router)
 
-# Fast-track: public UI shell only. All document APIs still require JWT.
-from backend.app.api.vault_ui import router as vault_ui_router
+# Public UI shell only. All document APIs still require JWT.
 app.include_router(vault_ui_router)
 
-# LESSON 69:
-# Encrypted uploads are disabled by default.
-#
-# Explicit activation requires:
-# SECUREVAULT_ENABLE_ENCRYPTED_UPLOAD=1
-#
-# Registration validates trusted database,
-# storage and DPAPI key configuration.
-#
-# Do not suppress configuration exceptions.
 
+# Encrypted storage is disabled unless SECUREVAULT_ENABLE_ENCRYPTED_UPLOAD=1.
+# Enabled mode runs the full preflight chain (key-file ACL, directory ACLs,
+# process identity, path topology, schema, key recovery) and refuses to start
+# if anything is wrong. Never suppress that error.
+_upload_environment = settings.upload_environment()
 
 encrypted_upload_activation = (
     activate_encrypted_upload_with_key_file_guard(
         app=app,
-        environment=os.environ
+        environment=_upload_environment
     )
 )
 
 
-
-
-
-
-# FAST-TRACK: Attach download only after all existing enabled-mode guards
-# have validated the deployment and registered the encrypted upload route.
-# Keep SECUREVAULT_ENABLE_ENCRYPTED_UPLOAD unset/0 until deployment review.
+# Attach download only after the enabled-mode guards have validated the
+# deployment and registered the encrypted upload route.
 if encrypted_upload_activation.get("registered") is True:
     from backend.app.security.encrypted_upload_registration import (
         check_encrypted_upload_configuration,
@@ -108,7 +89,7 @@ if encrypted_upload_activation.get("registered") is True:
         create_jwt_encrypted_download_router,
     )
 
-    _encrypted_config = check_encrypted_upload_configuration(os.environ)
+    _encrypted_config = check_encrypted_upload_configuration(_upload_environment)
     app.include_router(
         create_jwt_encrypted_download_router(
             db_path=_encrypted_config["db_path"],
@@ -125,14 +106,12 @@ def home():
     }
 
 
-# SECUREVAULT BATCH 2 - DEMO ONLY
-from backend.app.api.vault_organizer import router as vault_organizer_router, observe_actions as vault_observe_actions
+# Folder / tag / favourite organisation and the user's activity feed.
 app.include_router(vault_organizer_router)
 vault_observe_actions(app)
 
 
-# SECUREVAULT BATCH 3 (ISOLATED DEMO)
-# Register the new binary routes only after existing Windows ACL / SID / KEK guards pass.
-if encrypted_upload_activation.get('registered') is True:
+# Binary-document vault: registered only after the same guards pass.
+if encrypted_upload_activation.get("registered") is True:
     from backend.app.api.vault_binary import API as vault_binary_router
     app.include_router(vault_binary_router)

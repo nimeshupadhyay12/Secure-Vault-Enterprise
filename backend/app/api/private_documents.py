@@ -20,7 +20,7 @@ from backend.app.security.upload_validation import (
 
 from pydantic import BaseModel, Field
 
-import os
+from backend.app.core import settings
 from backend.app.security.vault_lifecycle import (
     EncryptedRenameBlocked, VaultLifecycleError,
     reject_encrypted_rename, delete_owned_document_and_ciphertext,
@@ -211,7 +211,7 @@ def remove_private_document(
             document_id=document_id,
             owner_user_id=user["user_id"],
             db_path=db_path,
-            storage_dir=os.environ.get("SECUREVAULT_UPLOAD_STORAGE_DIR"),
+            storage_dir=settings.get("SECUREVAULT_UPLOAD_STORAGE_DIR"),
         )
     except (VaultLifecycleError, ValueError):
         raise HTTPException(status_code=503, detail="Safe document deletion unavailable") from None

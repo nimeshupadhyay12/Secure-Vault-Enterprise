@@ -21,13 +21,22 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response
 from backend.app.api.auth import get_current_user
+from backend.app.core import settings
 from backend.app.security.windows_kek_store import load_protected_kek
 
 API = APIRouter(prefix='/vault/binary', tags=['Encrypted binary documents'])
-ROOT = Path(__file__).resolve().parents[3]  # demo runtime
-CORE_DB = ROOT / 'backend' / 'data' / 'securevault.db'
-BINARY_DB = ROOT / 'backend' / 'data' / 'vault_binary.db'
-BINARY_DIR = ROOT.parent / 'binary-files'
+
+
+# Locations come from the central settings module (SECUREVAULT_BINARY_DB_PATH,
+# SECUREVAULT_BINARY_STORAGE_DIR) and are resolved per call.
+def _binary_db():
+    return settings.binary_db_path()
+
+
+def _binary_dir():
+    return settings.binary_storage_dir()
+
+
 LIMIT = 5 * 1024 * 1024
 FILENAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,99}\.(?:pdf|docx|xlsx|png|jpg|jpeg)$', re.I)
 MEDIA = {'.pdf':'application/pdf','.docx':'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
@@ -47,15 +56,18 @@ def _open_database(path, *, readonly=False):
 
 
 def _check_storage():
-    if not BINARY_DIR.is_dir() or BINARY_DIR.is_symlink():
+    root = _binary_dir()
+    if not root.is_dir() or root.is_symlink():
         raise RuntimeError('Protected binary storage unavailable')
-    # Directory is created by guarded installer, never by HTTP requests.
-    return BINARY_DIR
+    # Directory is created by `python -m backend.manage setup`, never by HTTP requests.
+    return root
 
 
 def _kek():
-    key_dir = os.environ.get('SECUREVAULT_UPLOAD_KEK_DIR', '')
-    key_id = os.environ.get('SECUREVAULT_UPLOAD_KEK_ID', '')
+    key_dir = settings.get('SECUREVAULT_UPLOAD_KEK_DIR', '') or ''
+    key_id = settings.get('SECUREVAULT_UPLOAD_KEK_ID', '') or ''
+    if not key_dir or not key_id:
+        raise RuntimeError('Protected key configuration missing')
     key = load_protected_kek(Path(key_dir), key_id)['kek']
     if type(key) is not bytes or len(key) != 32:
         raise RuntimeError('Invalid protected demo key')
@@ -133,7 +145,7 @@ def create_binary(*, owner, filename, body):
     file_path=_cipher_path(storage)
     tmp=file_path.with_name(file_path.name+'.pending')
     digest=hashlib.sha256(body).hexdigest()
-    with closing(_open_database(BINARY_DB)) as db:
+    with closing(_open_database(_binary_db())) as db:
         try:
             db.execute('BEGIN IMMEDIATE')
             db.execute('''INSERT INTO binary_documents(owner_id,filename,media_type,size_bytes,sha256,storage_id,nonce,wrap_nonce,wrapped_dek,created_at,status)
@@ -160,7 +172,7 @@ def create_binary(*, owner, filename, body):
 
 
 def _find(owner, file_id):
-    with closing(_open_database(BINARY_DB,readonly=True)) as db:
+    with closing(_open_database(_binary_db(),readonly=True)) as db:
         row=db.execute('SELECT * FROM binary_documents WHERE id=? AND owner_id=? AND status=?',
                        (file_id,owner,'ready')).fetchone()
         return dict(row) if row else None
@@ -182,7 +194,7 @@ def read_binary(*,owner,file_id):
 
 def delete_binary(*,owner,file_id):
     root=_check_storage()
-    with closing(_open_database(BINARY_DB)) as db:
+    with closing(_open_database(_binary_db())) as db:
         db.execute('BEGIN IMMEDIATE')
         row=db.execute("SELECT storage_id FROM binary_documents WHERE id=? AND owner_id=? AND status='ready'",(file_id,owner)).fetchone()
         if row is None:
@@ -207,7 +219,7 @@ def delete_binary(*,owner,file_id):
 @API.get('/files')
 def list_files(user=Depends(get_current_user),limit:int=Query(50,ge=1,le=100),offset:int=Query(0,ge=0)):
     owner=_user(user)
-    with closing(_open_database(BINARY_DB,readonly=True)) as db:
+    with closing(_open_database(_binary_db(),readonly=True)) as db:
         count=db.execute("SELECT COUNT(*) FROM binary_documents WHERE owner_id=? AND status='ready'",(owner,)).fetchone()[0]
         rows=db.execute("SELECT id,filename,media_type,size_bytes,sha256,created_at FROM binary_documents WHERE owner_id=? AND status='ready' ORDER BY id DESC LIMIT ? OFFSET ?",(owner,limit,offset)).fetchall()
     return {'files':[dict(r) for r in rows],'total':count,'limit':limit,'offset':offset}
