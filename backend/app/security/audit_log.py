@@ -174,10 +174,19 @@ def verify_chain(db_path=None):
         rows = connection.execute("SELECT * FROM audit_log ORDER BY id ASC").fetchall()
 
     expected_prev = GENESIS_HASH
+    seen_hmac = False
     for row in rows:
         entry = dict(row)
         report["entries"] += 1
         report["modes"][entry["mac_alg"]] = report["modes"].get(entry["mac_alg"], 0) + 1
+        if entry["mac_alg"] == "hmac-sha256":
+            seen_hmac = True
+        elif seen_hmac:
+            # Once the chain is keyed, an unkeyed entry means someone without
+            # the key appended or re-chained entries (downgrade attempt).
+            report.update(ok=False, first_bad_id=entry["id"],
+                          reason="unkeyed entry after keyed entries (downgrade)")
+            return report
         if entry["prev_hash"] != expected_prev:
             report.update(ok=False, first_bad_id=entry["id"],
                           reason="chain broken (entry removed, inserted or reordered)")

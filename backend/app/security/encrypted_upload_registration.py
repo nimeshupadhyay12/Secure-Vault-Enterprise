@@ -83,7 +83,7 @@ def check_encrypted_upload_configuration(environment):
             value = environment.get(name)
 
             if type(value) is not str or not value:
-                raise ValueError("Missing setting")
+                raise ValueError(f"{name} is not set")
 
             values[name] = value
 
@@ -140,7 +140,11 @@ def check_encrypted_upload_configuration(environment):
             }
 
             if not required_tables.issubset(found_tables):
-                raise ValueError("Database schema missing")
+                raise ValueError(
+                    "database schema missing "
+                    f"{sorted(required_tables - found_tables)} "
+                    "(run python -m backend.manage setup)"
+                )
 
         # Confirm the existing DPAPI-protected KEK
         # can be recovered by this Windows account.
@@ -166,9 +170,9 @@ def check_encrypted_upload_configuration(environment):
             "key_recovery_verified": True
         }
 
-    except Exception:
+    except Exception as error:
         raise EncryptedUploadRegistrationError(
-            "Encrypted upload configuration unavailable"
+            f"Encrypted upload configuration unavailable: {error}"
         ) from None
 
 

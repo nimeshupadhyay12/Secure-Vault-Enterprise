@@ -25,8 +25,15 @@ from backend.app.security.encrypted_upload_registration import (
 )
 
 
+import os
+
 EXPECTED_SID_SETTING = (
     "SECUREVAULT_UPLOAD_WINDOWS_SID"
+)
+
+# Linux/macOS equivalent: the numeric user id the server must run as.
+EXPECTED_UID_SETTING = (
+    "SECUREVAULT_UPLOAD_EXPECTED_UID"
 )
 
 
@@ -80,12 +87,18 @@ def validate_windows_deployment_identity(
         if environment is None:
             raise ValueError("Missing environment")
 
+        if os.name != "nt":
+            return _validate_posix_identity(environment)
+
         expected_sid = environment.get(
             EXPECTED_SID_SETTING
         )
 
         if type(expected_sid) is not str:
-            raise ValueError("Expected SID is missing")
+            raise ValueError(
+                f"{EXPECTED_SID_SETTING} is not set "
+                "(python -m backend.manage setup writes it)"
+            )
 
         # Accept normal Windows SID notation.
         if re.fullmatch(
@@ -100,17 +113,38 @@ def validate_windows_deployment_identity(
             type(actual_sid) is not str
             or actual_sid != expected_sid
         ):
-            raise ValueError("Windows identity mismatch")
+            raise ValueError(
+                "server process is not running as the account "
+                f"in {EXPECTED_SID_SETTING}"
+            )
 
         return {
             "identity_verified": True
         }
 
-    except Exception:
+    except Exception as error:
         raise EncryptedUploadRegistrationError(
-            "Encrypted upload Windows identity "
-            "verification failed"
+            "Encrypted upload process identity "
+            f"verification failed: {error}"
         ) from None
+
+
+def _validate_posix_identity(environment):
+    """Require the effective uid configured in SECUREVAULT_UPLOAD_EXPECTED_UID."""
+
+    expected = environment.get(EXPECTED_UID_SETTING)
+
+    if type(expected) is not str or not expected.isdigit():
+        raise ValueError(
+            f"{EXPECTED_UID_SETTING} must be the numeric uid of the server account"
+        )
+
+    if int(expected) != os.geteuid():
+        raise ValueError(
+            f"server process uid does not match {EXPECTED_UID_SETTING}"
+        )
+
+    return {"identity_verified": True}
 
 
 def activate_encrypted_upload_with_identity(

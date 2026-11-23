@@ -87,7 +87,7 @@ def validate_encrypted_upload_deployment(environment):
             value = environment.get(setting)
 
             if type(value) is not str or not value:
-                raise ValueError("Missing path")
+                raise ValueError(f"{setting} is not set")
 
             values[setting] = value
 
@@ -129,9 +129,9 @@ def validate_encrypted_upload_deployment(environment):
             "key_directory": key_directory
         }
 
-    except (OSError, ValueError, TypeError, AttributeError):
+    except (OSError, ValueError, TypeError, AttributeError) as error:
         raise EncryptedUploadRegistrationError(
-            "Encrypted upload deployment paths are unsafe"
+            f"Encrypted upload deployment paths are unsafe: {error}"
         ) from None
 
 

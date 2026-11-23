@@ -1,6 +1,5 @@
 
 import json
-import re
 import secrets
 import sqlite3
 
@@ -22,6 +21,8 @@ from backend.app.security.integrity import (
     verify_sha256
 )
 
+from backend.app.security import document_types
+
 from backend.app.security.encrypted_storage import (
     validate_storage_id
 )
@@ -33,15 +34,10 @@ def _validate_kek(kek):
 
 
 def _validate_filename(filename):
-    if (
-        type(filename) is not str
-        or re.fullmatch(
-            r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\.txt",
-            filename
-        ) is None
-        or ".." in filename
-    ):
-        raise ValueError("Unsafe practice filename")
+    try:
+        document_types.validate_filename(filename)
+    except ValueError:
+        raise ValueError("Unsafe document filename") from None
 
 
 def _get_owned_metadata(
@@ -132,8 +128,8 @@ def save_practice_document(
     if type(plaintext) is not bytes or not plaintext:
         raise ValueError("Practice content must be bytes")
 
-    if len(plaintext) > 1024 * 1024:
-        raise ValueError("Practice content is too large")
+    if len(plaintext) > document_types.max_document_bytes():
+        raise ValueError("Document content is too large")
 
     storage_dir = Path(storage_dir)
 

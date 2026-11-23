@@ -109,6 +109,10 @@ SETTINGS_REFERENCE = {
         "900",
         "How long a username stays locked after too many failures.",
     ),
+    "SECUREVAULT_MAX_DOCUMENT_BYTES": (
+        str(5 * 1024 * 1024),
+        "Largest accepted document (bytes, max 50 MiB) for /documents/encrypted.",
+    ),
     "SECUREVAULT_MAX_REQUEST_BYTES": (
         str(6 * 1024 * 1024),
         "Hard cap on any request body (checked before handlers run).",

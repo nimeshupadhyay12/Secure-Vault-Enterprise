@@ -9,6 +9,8 @@ Never changes ACLs, creates keys or writes
 to the application database.
 """
 
+import os
+import stat
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -71,6 +73,19 @@ BROAD_READ_MASK = (
 )
 
 
+def inspect_posix_permissions(target):
+    """POSIX equivalent of the DACL summary."""
+
+    mode = stat.S_IMODE(os.stat(target).st_mode)
+
+    return {
+        "dacl_present": True,
+        "broad_read": bool(mode & 0o055),
+        "broad_write": bool(mode & 0o022),
+        "inherited_ace_count": 0
+    }
+
+
 def inspect_directory_acl(directory):
     """
     Read the existing Windows DACL.
@@ -80,7 +95,14 @@ def inspect_directory_acl(directory):
 
     This is a conservative direct-ACE check,
     not a complete effective-access analysis.
+
+    On Linux/macOS the POSIX mode bits are used
+    instead: group/other read or execute counts
+    as broad read, group/other write as broad write.
     """
+
+    if os.name != "nt":
+        return inspect_posix_permissions(directory)
 
     import win32security
 
@@ -181,12 +203,14 @@ def validate_encrypted_upload_acls(environment):
 
         if storage_acl["broad_write"]:
             raise ValueError(
-                "Encrypted storage has broad write access"
+                "encrypted storage directory is writable by "
+                "broad groups (Everyone/Users or group/other)"
             )
 
         if key_acl["broad_read"] or key_acl["broad_write"]:
             raise ValueError(
-                "Protected key directory has broad access"
+                "protected key directory is accessible to "
+                "broad groups (Everyone/Users or group/other)"
             )
 
         return {
@@ -195,9 +219,9 @@ def validate_encrypted_upload_acls(environment):
             "key_directory_checked": True
         }
 
-    except Exception:
+    except Exception as error:
         raise EncryptedUploadRegistrationError(
-            "Encrypted upload ACL preflight failed"
+            f"Encrypted upload ACL preflight failed: {error}"
         ) from None
 
 

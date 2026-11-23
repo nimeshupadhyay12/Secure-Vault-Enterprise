@@ -1,20 +1,20 @@
 
-import re
+
+from backend.app.security import document_types
 
 
-# Conservative practice limit: 1 MiB.
-# We will reconcile this with the existing
-# FastAPI upload limit before integration.
-MAX_PRACTICE_UPLOAD_BYTES = 1024 * 1024
+# Default per-document limit (5 MiB). The effective limit is
+# SECUREVAULT_MAX_DOCUMENT_BYTES, see max_upload_bytes().
+MAX_PRACTICE_UPLOAD_BYTES = document_types.DEFAULT_MAX_DOCUMENT_BYTES
 
-# Example accepted names:
-# report.txt
-# quarterly_report_2026.txt
-# notes-v2.TXT
-SAFE_FILENAME = re.compile(
-    r"[A-Za-z0-9][A-Za-z0-9._-]*\.txt",
-    re.IGNORECASE
-)
+
+def max_upload_bytes():
+    """Effective per-document size limit from configuration."""
+
+    return document_types.max_document_bytes()
+
+# Shared allow-list (report.txt, scan.pdf, budget.xlsx, ...).
+SAFE_FILENAME = document_types.SAFE_FILENAME
 
 # Windows reserves these device names,
 # including when followed by an extension.
@@ -44,41 +44,19 @@ def _validate_positive_id(value):
 
 def _validate_filename(filename):
     """
-    Accept only conservative, simple .txt names.
+    Accept only conservative, simple names with an
+    allowed document extension (see document_types).
 
     Do not accept folder paths or special
     Windows device names.
     """
 
-    if type(filename) is not str:
+    try:
+        document_types.validate_filename(filename)
+    except ValueError:
         raise EncryptedUploadPreflightError(
             "Invalid upload metadata"
-        )
-
-    if not 5 <= len(filename) <= 128:
-        raise EncryptedUploadPreflightError(
-            "Invalid upload metadata"
-        )
-
-    if SAFE_FILENAME.fullmatch(filename) is None:
-        raise EncryptedUploadPreflightError(
-            "Invalid upload metadata"
-        )
-
-    # Avoid ambiguous repeated dots.
-    if ".." in filename:
-        raise EncryptedUploadPreflightError(
-            "Invalid upload metadata"
-        )
-
-    # The part before the first dot cannot be
-    # a reserved Windows device name.
-    basename = filename.split(".", 1)[0].upper()
-
-    if basename in WINDOWS_RESERVED_NAMES:
-        raise EncryptedUploadPreflightError(
-            "Invalid upload metadata"
-        )
+        ) from None
 
     return filename
 
@@ -88,7 +66,7 @@ def prepare_encrypted_upload(
     content,
     owner_user_id,
     document_id,
-    max_bytes=MAX_PRACTICE_UPLOAD_BYTES
+    max_bytes=None
 ):
     """
     Validate input for a future encrypted upload.
@@ -111,10 +89,14 @@ def prepare_encrypted_upload(
         if not _validate_positive_id(document_id):
             raise ValueError("Invalid document ID")
 
+        configured_limit = max_upload_bytes()
+
+        if max_bytes is None:
+            max_bytes = configured_limit
+
         if (
             type(max_bytes) is not int
-            or not 1 <= max_bytes
-                <= MAX_PRACTICE_UPLOAD_BYTES
+            or not 1 <= max_bytes <= configured_limit
         ):
             raise ValueError("Invalid size limit")
 
@@ -131,11 +113,18 @@ def prepare_encrypted_upload(
         if not 1 <= content_size <= max_bytes:
             raise ValueError("Invalid content size")
 
+        # Structural check for the declared type
+        # (UTF-8 text, PDF, DOCX, XLSX, PNG, JPEG).
+        media_type = document_types.check_content(
+            safe_name, content
+        )
+
         # Intentionally do not return the content.
         return {
             "ready": True,
             "filename": safe_name,
             "size_bytes": content_size,
+            "media_type": media_type,
             "owner_user_id": owner_user_id,
             "document_id": document_id,
             "encryption_required": True,

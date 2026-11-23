@@ -2,7 +2,8 @@
 // SecureVault Batch 2 - isolated demo organization + audit; existing crypto APIs unchanged
 (() => {
   const $ = id => document.getElementById(id);
-  const MAX_DOCS = 500, FETCH_PAGE = 100, PAGE_SIZE = 15;
+  const MAX_DOCS = 500, FETCH_PAGE = 100, PAGE_SIZE = 15, MAX_BYTES = 5 * 1024 * 1024;
+  const SAFE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}\.(txt|pdf|docx|xlsx|png|jpe?g)$/i;
   let token = null, refreshToken = null, owner = null, enabled = false;
   let documents = [], serverTotal = 0, truncated = false, page = 0, selected = null, busyUpload = false;
   const activity = [];
@@ -216,12 +217,22 @@
     const link = document.createElement('a'); link.href = url; link.download = safe; document.body.append(link); link.click(); link.remove();
     setTimeout(() => URL.revokeObjectURL(url), 30000);
   }
+  async function sha256Hex(bytes) {
+    if (!crypto?.subtle) return null;
+    const digest = await crypto.subtle.digest('SHA-256', bytes);
+    return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2,'0')).join('');
+  }
   async function downloadDoc(doc, control) {
     control.disabled = true;
     try {
       const response = await api(`/documents/${encodeURIComponent(doc.id)}/encrypted-content`);
-      const bytes = await response.arrayBuffer(); saveBlob(bytes, doc.filename);
-      logAction(`Downloaded document ${doc.id}`); await loadActivity(); show('Decrypted download prepared.');
+      const bytes = await response.arrayBuffer();
+      // Second, independent integrity check in the browser.
+      const expected = String(response.headers.get('X-Content-SHA256') || doc.sha256 || '').toLowerCase();
+      const actual = await sha256Hex(bytes);
+      if (actual !== null && expected && actual !== expected) throw new Error('Integrity check failed: SHA-256 mismatch. File not saved.');
+      saveBlob(bytes, doc.filename);
+      logAction(`Downloaded document ${doc.id}`); await loadActivity(); show(actual ? 'Decrypted download verified (SHA-256) and prepared.' : 'Decrypted download prepared.');
     } catch (error) { show(error.message,true); }
     finally { control.disabled = !enabled; }
   }
@@ -239,24 +250,17 @@
     if (busyUpload) return;
     if (!enabled) { show('Encrypted storage is disabled.',true); return; }
     const file = selected || $('file').files?.[0];
-    if (!file) { show('Choose a text file.',true); return; }
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}\.txt$/.test(file.name) || file.name.includes('..')) { show('Choose a safe .txt filename (letters, digits, underscores, hyphens, periods).',true); return; }
-    if (file.size < 1 || file.size > 1048576) { show('File size must be 1 byte to 1 MiB.',true); return; }
-    let createdId = null;
+    if (!file) { show('Choose a document.',true); return; }
+    if (!SAFE_NAME.test(file.name) || file.name.includes('..')) { show('Use a simple filename ending in .txt, .pdf, .docx, .xlsx, .png, .jpg or .jpeg.',true); return; }
+    if (file.size < 1 || file.size > MAX_BYTES) { show('File size must be 1 byte to 5 MiB.',true); return; }
     try {
-      busy(true, 'Validating UTF-8 and preparing metadata…');
-      const bytes = await file.arrayBuffer();
-      const text = new TextDecoder('utf-8', { fatal:true }).decode(bytes);
-      if (!text || text.length > 10000) throw new Error('Text must contain 1–10,000 characters.');
-      busy(true, 'Creating owned document metadata…');
-      const meta = await json('/documents/private', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({filename:file.name,content:text}) });
-      createdId = meta.id;
       busy(true, 'Encrypting and saving file on the server…');
-      await json(`/documents/${encodeURIComponent(meta.id)}/encrypted-content?filename=${encodeURIComponent(file.name)}`, { method:'POST', headers:{'Content-Type':'application/octet-stream'}, body:bytes });
+      const bytes = await file.arrayBuffer();
+      const meta = await json(`/documents/encrypted?filename=${encodeURIComponent(file.name)}`, { method:'POST', headers:{'Content-Type':'application/octet-stream'}, body:bytes });
       updateSelected(null); $('file').value = '';
-      logAction(`Encrypted upload completed for document ${createdId}`); await loadDocuments(); show('Encrypted upload completed.');
+      logAction(`Encrypted upload completed for document ${meta.id}`); await loadDocuments(); show(`Encrypted upload completed (SHA-256 ${String(meta.sha256).slice(0,12)}…).`);
     } catch (error) {
-      show(`${createdId !== null ? `Metadata record ${createdId} may remain; encrypted upload failed. ` : ''}${error.message}`,true);
+      show(`Encrypted upload failed: ${error.message}`,true);
     } finally { busy(false); }
   }
   async function loadOrganization() {
@@ -300,18 +304,16 @@
   }
   async function resumeUpload(doc, control){
     if (!enabled || !token) return;
-    const chooser=document.createElement('input');chooser.type='file';chooser.accept='.txt,text/plain';
+    const chooser=document.createElement('input');chooser.type='file';chooser.accept='.txt,.pdf,.docx,.xlsx,.png,.jpg,.jpeg';
     chooser.addEventListener('change',async()=>{
       const file=chooser.files?.[0];if(!file)return;
       if(file.name!==doc.filename || file.size!==Number(doc.size_bytes)){show('Resume blocked: filename or size does not match saved metadata.',true);return;}
-      if(file.size<1||file.size>1048576){show('Resume file must be 1 byte–1 MiB.',true);return;}
+      if(file.size<1||file.size>MAX_BYTES){show('Resume file must be 1 byte–5 MiB.',true);return;}
       control.disabled=true;
       try{
         const bytes=await file.arrayBuffer();
-        new TextDecoder('utf-8',{fatal:true}).decode(bytes);
-        if(!crypto?.subtle)throw new Error('Browser SHA-256 support is required');
-        const digest=await crypto.subtle.digest('SHA-256',bytes);
-        const hash=Array.from(new Uint8Array(digest)).map(b=>b.toString(16).padStart(2,'0')).join('');
+        const hash=await sha256Hex(bytes);
+        if(hash===null)throw new Error('Browser SHA-256 support is required');
         if(hash.toLowerCase()!==String(doc.sha256||'').toLowerCase())throw new Error('Resume blocked: SHA-256 does not match metadata');
         if(!confirm(`Resume encrypted upload for existing document ID ${doc.id}?`))return;
         await json(`/documents/${encodeURIComponent(doc.id)}/encrypted-content?filename=${encodeURIComponent(doc.filename)}`,{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:bytes});

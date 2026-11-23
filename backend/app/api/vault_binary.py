@@ -5,13 +5,11 @@ File length <= 5 MiB; image/OOXML checks are structural, not malware scanning.
 """
 from __future__ import annotations
 import hashlib
-import io
 import json
 import os
 import re
 import secrets
 import sqlite3
-import zipfile
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,7 +21,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response
 from backend.app.api.auth import get_current_user
 from backend.app.core import settings
-from backend.app.security import audit_log
+from backend.app.security import audit_log, document_types
 from backend.app.security.integrity import IntegrityVerificationError, verify_sha256
 from backend.app.security.windows_kek_store import load_protected_kek
 
@@ -118,48 +116,17 @@ def _user(user):
     return uid
 
 
-def _is_safe_member(member):
-    return (not member.startswith('/') and '\\' not in member and
-            all(x not in ('', '..') for x in member.split('/')))
-
-
 def validate(filename, data):
-    """Limited structural checks; these do not establish that a file is harmless."""
+    """Limited structural checks; these do not establish that a file is harmless.
+
+    Shares the allow-list in security/document_types.py (minus .txt, which
+    belongs to the main encrypted-content path).
+    """
     if type(filename) is not str or not FILENAME_RE.fullmatch(filename) or '..' in filename:
         raise ValueError('Unsupported or unsafe filename; PDF, DOCX, XLSX, PNG, JPG only')
     if type(data) is not bytes or not 1 <= len(data) <= LIMIT:
         raise ValueError('File must contain 1 byte to 5 MiB')
-    ext = Path(filename).suffix.lower()
-    if ext == '.pdf':
-        if not data.startswith(b'%PDF-') or b'%%EOF' not in data[-2048:]:
-            raise ValueError('PDF header/trailer validation failed')
-    elif ext == '.png':
-        if not data.startswith(b'\x89PNG\r\n\x1a\n') or len(data)<33 or data[12:16] != b'IHDR':
-            raise ValueError('PNG structure validation failed')
-    elif ext in ('.jpg','.jpeg'):
-        if not (len(data)>=4 and data[:2]==b'\xff\xd8' and data[-2:]==b'\xff\xd9'):
-            raise ValueError('JPEG structure validation failed')
-    else:
-        try:
-            with zipfile.ZipFile(io.BytesIO(data)) as archive:
-                members = archive.infolist()
-                if len(members)>512: raise ValueError('Too many archive entries')
-                total = 0
-                names = set()
-                for member in members:
-                    if not _is_safe_member(member.filename): raise ValueError('Unsafe archive path')
-                    if member.flag_bits & 1: raise ValueError('Encrypted OOXML archive refused')
-                    total += member.file_size
-                    if total>24*1024*1024: raise ValueError('OOXML decompression budget exceeded')
-                    if member.file_size>2*1024*1024 and member.file_size>max(member.compress_size,1)*100:
-                        raise ValueError('Suspicious compressed entry')
-                    names.add(member.filename)
-                required = 'word/document.xml' if ext=='.docx' else 'xl/workbook.xml'
-                if not {'[Content_Types].xml',required}.issubset(names):
-                    raise ValueError('Missing expected DOCX/XLSX parts')
-        except (zipfile.BadZipFile, EOFError, OSError) as err:
-            raise ValueError('Invalid Office Open XML document') from err
-    return MEDIA[ext]
+    return document_types.check_content(filename, data)
 
 
 def _aad(owner, file_id, storage, filename):

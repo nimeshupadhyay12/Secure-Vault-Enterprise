@@ -8,6 +8,8 @@ allowing encrypted-upload activation.
 No ACL changes, key creation, or database writes.
 """
 
+import os
+import stat
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -55,12 +57,22 @@ def inspect_protected_key_file_acl(file_path):
     never the protected key's contents.
     """
 
-    import win32security
-
     path = Path(file_path)
 
     if not path.is_file() or path.is_symlink():
         raise ValueError("Protected key file unavailable")
+
+    if os.name != "nt":
+        # POSIX: group/other read or write on the key file is too broad.
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        return {
+            "dacl_present": True,
+            "broad_read": bool(mode & 0o044),
+            "broad_write": bool(mode & 0o022),
+            "inherited_ace_count": 0
+        }
+
+    import win32security
 
     security = win32security.GetNamedSecurityInfo(
         str(path),
@@ -158,7 +170,7 @@ def validate_protected_key_file_acl(environment):
         )
 
         if type(key_id) is not str:
-            raise ValueError("Missing key ID")
+            raise ValueError("SECUREVAULT_UPLOAD_KEK_ID is not set")
 
         # The existing key-store helper validates
         # the key ID and constructs the filename.
@@ -172,7 +184,8 @@ def validate_protected_key_file_acl(environment):
             or key_file.is_symlink()
         ):
             raise ValueError(
-                "Existing protected key required"
+                f"protected key file {key_file.name} not found "
+                "(run python -m backend.manage setup)"
             )
 
         # Refuse a file that resolves outside
@@ -200,7 +213,7 @@ def validate_protected_key_file_acl(environment):
 
         if result["broad_read"] or result["broad_write"]:
             raise ValueError(
-                "Protected key file has broad access"
+                "protected key file is accessible to broad groups"
             )
 
         return {
@@ -211,9 +224,9 @@ def validate_protected_key_file_acl(environment):
             )
         }
 
-    except Exception:
+    except Exception as error:
         raise EncryptedUploadRegistrationError(
-            "Protected key-file ACL preflight failed"
+            f"Protected key-file ACL preflight failed: {error}"
         ) from None
 
 
