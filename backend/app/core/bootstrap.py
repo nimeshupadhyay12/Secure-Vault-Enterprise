@@ -248,3 +248,22 @@ def run_check(environ=None):
     if result.get("registered") is not True:
         return False, "Encrypted upload was not registered"
     return True, "key file ACL, directory ACLs, process identity, paths, schema and key recovery verified"
+
+
+def update_config_value(config_path: Path, name: str, value: str) -> None:
+    """Set one KEY=VALUE in the config file, keeping every other line."""
+
+    from backend.app.security.fs_permissions import restrict_to_owner
+
+    lines = config_path.read_text(encoding="utf-8").splitlines() if config_path.is_file() else []
+    replaced = False
+    for index, line in enumerate(lines):
+        if line.split("=", 1)[0].strip() == name:
+            lines[index] = f"{name}={value}"
+            replaced = True
+    if not replaced:
+        lines.append(f"{name}={value}")
+    temporary = config_path.with_name(config_path.name + ".tmp")
+    temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.replace(temporary, config_path)
+    restrict_to_owner(config_path)

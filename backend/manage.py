@@ -4,6 +4,7 @@
     python -m backend.manage check
     python -m backend.manage create-user USERNAME
     python -m backend.manage audit-verify [--db PATH]
+    python -m backend.manage rotate-kek --new-key-id ID
 
 Run from the repository root. Configuration is read from the environment and
 ``runtime/securevault.env`` (see backend/app/core/settings.py).
@@ -37,6 +38,40 @@ def cmd_check(args) -> int:
     ok, message = run_check()
     print(("OK: " if ok else "FAILED: ") + message, file=sys.stdout if ok else sys.stderr)
     return 0 if ok else 1
+
+
+def cmd_rotate_kek(args) -> int:
+    import os
+    from pathlib import Path
+
+    from backend.app.core import settings
+    from backend.app.core.bootstrap import update_config_value
+    from backend.app.security import audit_log
+    from backend.app.security.kek_rotation import KekRotationError, rotate_kek
+
+    old_key_id = settings.get("SECUREVAULT_UPLOAD_KEK_ID")
+    key_dir = settings.get("SECUREVAULT_UPLOAD_KEK_DIR")
+    if not old_key_id or not key_dir:
+        print("SECUREVAULT_UPLOAD_KEK_ID and SECUREVAULT_UPLOAD_KEK_DIR must be configured "
+              "(run setup first).", file=sys.stderr)
+        return 2
+    try:
+        result = rotate_kek(db_path=settings.db_path(), binary_db=settings.binary_db_path(),
+                            key_dir=Path(key_dir), old_key_id=old_key_id, new_key_id=args.new_key_id)
+    except (KekRotationError, ValueError, OSError) as error:
+        print(f"Rotation stopped: {error}", file=sys.stderr)
+        return 1
+    audit_log.record_event("kek_rotated", detail={"from": old_key_id, "to": args.new_key_id, **result},
+                           db_path=settings.db_path())
+    print(f"Re-wrapped {result['documents_rewrapped']} document keys and "
+          f"{result['binary_rewrapped']} binary keys; no ciphertext file was touched.")
+    if os.environ.get("SECUREVAULT_UPLOAD_KEK_ID"):
+        print(f"SECUREVAULT_UPLOAD_KEK_ID is set in the environment: change it to {args.new_key_id}.")
+    else:
+        update_config_value(settings.config_file_path(), "SECUREVAULT_UPLOAD_KEK_ID", args.new_key_id)
+        print(f"Config updated: SECUREVAULT_UPLOAD_KEK_ID={args.new_key_id}")
+    print(f"The old KEK file ({old_key_id}) was kept for older backups; delete it once they are retired.")
+    return 0
 
 
 def cmd_audit_verify(args) -> int:
@@ -91,6 +126,10 @@ def build_parser() -> argparse.ArgumentParser:
     audit = sub.add_parser("audit-verify", help="Recompute the audit-log hash chain")
     audit.add_argument("--db", default=None, help="Database path (default: SECUREVAULT_DB_PATH)")
     audit.set_defaults(func=cmd_audit_verify)
+
+    rotate = sub.add_parser("rotate-kek", help="Re-wrap every data key under a new KEK (stop the API first)")
+    rotate.add_argument("--new-key-id", required=True)
+    rotate.set_defaults(func=cmd_rotate_kek)
 
     user = sub.add_parser("create-user", help="Create a vault user (password prompted)")
     user.add_argument("username")

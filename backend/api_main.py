@@ -9,7 +9,7 @@ variables first, then ``runtime/securevault.env`` written by
 
 from fastapi import Depends, FastAPI
 
-from backend.app.core import settings
+from backend.app.core import http_security, settings
 
 from backend.app.security.encrypted_upload_key_file_guard import (
     activate_encrypted_upload_with_key_file_guard
@@ -42,10 +42,17 @@ def create_app(environment=None):
     if environment is None:
         environment = settings.upload_environment()
 
+    docs = settings.get_bool("SECUREVAULT_ENABLE_DOCS", True)
     app = FastAPI(
         title="SecureVault Enterprise API",
-        version="0.8.0"
+        version="0.8.0",
+        docs_url="/docs" if docs else None,
+        redoc_url="/redoc" if docs else None,
+        openapi_url="/openapi.json" if docs else None,
     )
+
+    # Security headers, request-size cap, optional HSTS and strict CORS.
+    http_security.install(app)
 
     # Health endpoint
     app.include_router(health_router)
