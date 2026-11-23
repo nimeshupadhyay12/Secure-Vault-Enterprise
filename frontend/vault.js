@@ -3,7 +3,7 @@
 (() => {
   const $ = id => document.getElementById(id);
   const MAX_DOCS = 500, FETCH_PAGE = 100, PAGE_SIZE = 15;
-  let token = null, owner = null, enabled = false;
+  let token = null, refreshToken = null, owner = null, enabled = false;
   let documents = [], serverTotal = 0, truncated = false, page = 0, selected = null, busyUpload = false;
   const activity = [];
   let organization = {}, auditEvents = [];
@@ -28,11 +28,39 @@
       li.append(time, text); list.append(li);
     }
   }
-  async function api(path, options = {}) {
+  // Access token (15 min) and refresh token live only in this closure: never
+  // in localStorage/sessionStorage, so other scripts and later visitors cannot read them.
+  let refreshInFlight = null;
+  function setSession(data) {
+    if (typeof data.access_token !== 'string' || !data.access_token) throw new Error('Token missing from response');
+    token = data.access_token;
+    refreshToken = typeof data.refresh_token === 'string' ? data.refresh_token : null;
+  }
+  // One shared refresh at a time: two parallel refreshes with the same token
+  // would look like token theft to the server (reuse detection) and end the session.
+  function refreshSession() {
+    if (!refreshToken) return Promise.resolve(false);
+    if (!refreshInFlight) {
+      refreshInFlight = (async () => {
+        try {
+          const response = await fetch('/auth/refresh', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ refresh_token: refreshToken }), cache:'no-store', credentials:'same-origin' });
+          if (!response.ok) return false;
+          setSession(await response.json());
+          return true;
+        } catch (_) { return false; }
+        finally { setTimeout(() => { refreshInFlight = null; }, 0); }
+      })();
+    }
+    return refreshInFlight;
+  }
+  async function api(path, options = {}, retried = false) {
     const headers = new Headers(options.headers || {});
     if (token) headers.set('Authorization', `Bearer ${token}`);
     const result = await fetch(path, { ...options, headers, cache:'no-store', credentials:'same-origin' });
-    if (result.status === 401 && token) { logout(true); throw new Error('Session expired. Sign in again.'); }
+    if (result.status === 401 && token) {
+      if (!retried && await refreshSession()) return api(path, options, true);
+      logout(true); throw new Error('Session expired. Sign in again.');
+    }
     if (!result.ok) {
       let detail = `Request failed (${result.status})`;
       try { const data = await result.json(); if (typeof data.detail === 'string') detail = data.detail; } catch (_) {}
@@ -42,7 +70,11 @@
   }
   const json = async (path, opts = {}) => (await api(path, opts)).json();
   function logout(silent = false) {
-    token = null; owner = null; documents = []; selected = null; page = 0;
+    if (token) {
+      // Server-side logout: revokes this access token and its refresh-token family.
+      fetch('/auth/logout', { method:'POST', headers:{'Authorization':`Bearer ${token}`,'Content-Type':'application/json'}, body:JSON.stringify({ refresh_token: refreshToken }), cache:'no-store', credentials:'same-origin' }).catch(() => {});
+    }
+    token = null; refreshToken = null; owner = null; documents = []; selected = null; page = 0;
     $('password').value = ''; $('loginPanel').hidden = false; $('workspace').hidden = true; $('logout').hidden = true;
     $('count').textContent = '—'; $('totalBytes').textContent = '—'; $('visibleCount').textContent = '—';
     $('documents').replaceChildren(); activity.length = 0; $('activityList').replaceChildren();
@@ -65,16 +97,14 @@
     event.preventDefault(); $('loginFormButton').disabled = true; show('Signing in…');
     try {
       const payload = JSON.stringify({ username: $('username').value, password: $('password').value });
-      let response = await fetch('/auth/token', { method:'POST', headers:{'Content-Type':'application/json'}, body:payload, cache:'no-store' });
-      if (response.status === 404) response = await fetch('/token', { method:'POST', headers:{'Content-Type':'application/json'}, body:payload, cache:'no-store' });
-      if (!response.ok) throw new Error(response.status === 401 ? 'Invalid username or password' : `Login failed (${response.status})`);
-      const data = await response.json();
-      if (typeof data.access_token !== 'string' || !data.access_token) throw new Error('Token missing from response');
-      token = data.access_token;
-      owner = await json('/auth/me').catch(async error => {
-        if (String(error.message).includes('404')) return json('/me');
-        throw error;
-      });
+      const response = await fetch('/auth/token', { method:'POST', headers:{'Content-Type':'application/json'}, body:payload, cache:'no-store' });
+      if (!response.ok) {
+        if (response.status === 401) throw new Error('Invalid username or password');
+        if (response.status === 429) throw new Error('Too many failed sign-in attempts. Wait and try again.');
+        throw new Error(`Login failed (${response.status})`);
+      }
+      setSession(await response.json());
+      owner = await json('/auth/me');
       $('password').value = ''; $('loginPanel').hidden = true; $('workspace').hidden = false; $('logout').hidden = false;
       $('welcome').textContent = owner.username ? `Signed in as ${owner.username}` : 'Authenticated workspace';
       await status(); await loadDocuments(); await loadActivity(); await loadBinaryFiles(); logAction('Signed in successfully'); show('Welcome to your vault.');
