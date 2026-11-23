@@ -31,7 +31,7 @@ def main():
         for index in indexes:
             print(index[1])
 
-        history == connection.execute(
+        history = connection.execute(
             """
             SELECT version, name
             FROM schema_migrations

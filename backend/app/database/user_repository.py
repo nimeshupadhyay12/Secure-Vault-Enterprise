@@ -63,12 +63,19 @@ def register_user(username, password, db_path=DATABASE_PATH, enforce_policy=True
                     (username, hashed_password)
                 )
 
-                return cursor.lastrowid
+                user_id = cursor.lastrowid
 
         except sqlite3.IntegrityError:
             raise ValueError(
                 "Username already exists."
             ) from None
+
+    # Imported here to keep the module import graph acyclic.
+    from backend.app.security import audit_log
+
+    audit_log.record_event("user_created", user_id=user_id, db_path=db_path)
+
+    return user_id
 
 
 def authenticate_user(

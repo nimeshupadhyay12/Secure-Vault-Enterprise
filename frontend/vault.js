@@ -277,7 +277,7 @@
       const data=await json('/vault/organize/activity?limit=30');
       auditEvents=Array.isArray(data.events)?data.events:[];
       const list=$('auditList');list.replaceChildren();
-      $('securitySummary').textContent=`${auditEvents.length} recent local events shown · Best-effort server log, not tamper resistant`;
+      $('securitySummary').textContent=`${auditEvents.length} recent events from your hash-chained, tamper-evident audit log`;
       if (!auditEvents.length) { const li=document.createElement('li');li.textContent='No persistent events yet.';list.append(li); }
       for(const item of auditEvents){const li=document.createElement('li');const label=document.createElement('span');label.className='auditpill';label.textContent=String(item.event_type).replaceAll('_',' ');const time=document.createElement('time');time.textContent=new Date(item.created_at).toLocaleString();const ref=document.createElement('span');ref.textContent=item.document_id?` · Document ${item.document_id}`:'';li.append(time,label,ref);list.append(li);}
     }catch(error){$('securitySummary').textContent='Audit history could not load: '+error.message;}

@@ -28,6 +28,8 @@ from backend.app.security.vault_lifecycle import (
 
 from backend.app.api.auth import get_current_user
 
+from backend.app.security import audit_log
+
 from backend.app.database.db import DATABASE_PATH
 
 
@@ -97,6 +99,11 @@ def create_private_document(
             status_code=500,
             detail="Created document could not be retrieved"
         )
+
+    audit_log.record_event(
+        "document_created", user_id=user["user_id"],
+        document_id=document_id, db_path=db_path
+    )
 
     # Include the timestamp in the API response.
     return {
@@ -193,6 +200,11 @@ def rename_private_document(
             detail="Document not found"
         )
 
+    audit_log.record_event(
+        "document_renamed", user_id=user["user_id"],
+        document_id=document_id, db_path=db_path
+    )
+
     return {
         "id": document_id,
         "filename": request.filename,
@@ -222,6 +234,11 @@ def remove_private_document(
             status_code=404,
             detail="Document not found"
         )
+
+    audit_log.record_event(
+        "document_deleted", user_id=user["user_id"],
+        document_id=document_id, db_path=db_path
+    )
 
     return {
         "id": document_id,

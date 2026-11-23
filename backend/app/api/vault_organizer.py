@@ -1,6 +1,8 @@
-"""Isolated-demo organizational metadata and best-effort server-observed event log.
+"""Folder / tag / favourite metadata (sidecar DB) and the user's activity feed.
 
-No original database schema changes. Do not use as a compliance audit trail.
+The activity feed reads the owner's own entries from the tamper-evident,
+hash-chained audit log (backend.app.security.audit_log). Security events are
+written there directly by the routes that perform the action.
 """
 from __future__ import annotations
 import json
@@ -9,12 +11,11 @@ import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from backend.app.api.auth import get_current_user
 from backend.app.core import settings
-from backend.app.security.tokens import decode_access_token
-from backend.app.database.user_repository import get_user_by_id
+from backend.app.security import audit_log
 
 
 
@@ -28,7 +29,6 @@ def _side_db():
 
 router = APIRouter(prefix='/vault/organize', tags=['Vault Organization'])
 NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9 _.-]{0,31}$')
-EVENTS = {'document_created', 'encrypted_uploaded', 'encrypted_downloaded', 'document_deleted', 'document_renamed', 'organization_updated'}
 
 
 def _connect(path: Path, *, readonly=False):
@@ -82,16 +82,6 @@ def _owned(document_id, owner_user_id):
     return dict(record)
 
 
-def _insert_event(owner, event, document=None):
-    if event not in EVENTS:
-        raise ValueError('Invalid event type')
-    with closing(_connect(_side_db())) as db, db:
-        db.execute('INSERT INTO vault_events(owner_user_id,document_id,event_type,created_at) VALUES (?,?,?,?)',
-                   (owner,document,event,datetime.now(timezone.utc).isoformat(timespec='seconds')))
-        if event == 'document_deleted' and document is not None:
-            db.execute('DELETE FROM document_organization WHERE document_id=?',(document,))
-
-
 def _validate_label(label):
     if not isinstance(label, str) or not NAME_RE.fullmatch(label) or '..' in label:
         raise HTTPException(422, 'Folder and tags must use 1–32 safe characters')
@@ -140,48 +130,21 @@ def save_organization(document_id: int, payload: OrganizationUpdate, user=Depend
             VALUES (?,?,?,?,?) ON CONFLICT(document_id) DO UPDATE SET folder=excluded.folder,tags=excluded.tags,
             favorite=excluded.favorite,updated_at=excluded.updated_at''',
             (document_id, folder, json.dumps(tags), int(payload.favorite),datetime.now(timezone.utc).isoformat(timespec='seconds')))
-    _insert_event(owner,'organization_updated',document_id)
+    audit_log.record_event('organization_updated', user_id=owner, document_id=document_id)
     return {'id':document_id,'folder':folder,'tags':tags,'favorite':payload.favorite}
 
 
 @router.get('/activity')
 def activity(limit:int=Query(30,ge=1,le=100), user=Depends(get_current_user)):
     owner = _owner(user)
-    with closing(_connect(_side_db(),readonly=True)) as db:
-        events = [dict(r) for r in db.execute('''SELECT id,document_id,event_type,created_at FROM vault_events
-                   WHERE owner_user_id=? ORDER BY id DESC LIMIT ?''',(owner,limit))]
-    return {'events':events, 'notice':'Best-effort local audit history; not tamper-resistant or compliance-grade'}
+    try:
+        events = audit_log.list_user_events(owner, limit=limit)
+    except Exception:
+        raise HTTPException(503, 'Activity history unavailable') from None
+    return {'events':events, 'notice':'Your entries from the hash-chained audit log; verify the chain with python -m backend.manage audit-verify'}
 
 
 def observe_actions(app):
-    """Observe successful API responses in this isolated runtime, never request bodies."""
-    @app.middleware('http')
-    async def vault_activity_observer(request:Request, call_next):
-        response = await call_next(request)
-        if response.status_code < 200 or response.status_code >= 300:
-            return response
-        path = request.url.path
-        method = request.method.upper()
-        event, document = None, None
-        if path == '/documents/private' and method == 'POST': event='document_created'
-        else:
-            match = re.fullmatch(r'/documents/(\d+)/encrypted-content',path)
-            if match and method in ('POST','GET'):
-                event = 'encrypted_uploaded' if method=='POST' else 'encrypted_downloaded'
-                document=int(match.group(1))
-            else:
-                match = re.fullmatch(r'/documents/private/(\d+)',path)
-                if match and method in ('DELETE','PATCH'):
-                    event='document_deleted' if method=='DELETE' else 'document_renamed'
-                    document=int(match.group(1))
-        if event is not None:
-            try:
-                authorization=request.headers.get('authorization','')
-                if authorization.startswith('Bearer '):
-                    owner=int(decode_access_token(authorization[7:]))
-                    if get_user_by_id(owner) is not None:
-                        _insert_event(owner,event,document)
-            except Exception:
-                # Operational audit errors never break an already successful file operation.
-                pass
-        return response
+    """Kept for backwards compatibility. Events are now recorded by the routes
+    themselves into the tamper-evident audit log, so nothing is observed here."""
+    return app
