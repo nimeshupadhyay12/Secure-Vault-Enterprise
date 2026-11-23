@@ -17,11 +17,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response
 from backend.app.api.auth import get_current_user
 from backend.app.core import settings
+from backend.app.security import audit_log
+from backend.app.security.integrity import IntegrityVerificationError, verify_sha256
 from backend.app.security.windows_kek_store import load_protected_kek
 
 API = APIRouter(prefix='/vault/binary', tags=['Encrypted binary documents'])
@@ -42,6 +45,40 @@ FILENAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,99}\.(?:pdf|docx|xlsx|pn
 MEDIA = {'.pdf':'application/pdf','.docx':'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
          '.xlsx':'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
          '.png':'image/png','.jpg':'image/jpeg','.jpeg':'image/jpeg'}
+
+
+BINARY_SCHEMA = (
+    """CREATE TABLE IF NOT EXISTS binary_documents (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        owner_id INTEGER NOT NULL CHECK (owner_id > 0),
+        filename TEXT NOT NULL,
+        media_type TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL CHECK (size_bytes > 0),
+        sha256 TEXT NOT NULL CHECK (length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
+        storage_id TEXT NOT NULL UNIQUE CHECK (length(storage_id) = 32 AND storage_id NOT GLOB '*[^0-9a-f]*'),
+        nonce BLOB CHECK (nonce IS NULL OR length(nonce) = 12),
+        wrap_nonce BLOB CHECK (wrap_nonce IS NULL OR length(wrap_nonce) = 12),
+        wrapped_dek BLOB CHECK (wrapped_dek IS NULL OR length(wrapped_dek) = 48),
+        created_at TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'ready'))
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_binary_documents_owner ON binary_documents(owner_id, status, id)",
+)
+
+
+def initialize_binary_database(path=None):
+    """Create the binary-document database and table (idempotent).
+
+    Called by ``python -m backend.manage setup``; never by HTTP requests.
+    """
+    path = Path(path) if path is not None else _binary_db()
+    if path.is_symlink():
+        raise RuntimeError('Binary database path cannot be a symbolic link')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(path)) as db, db:
+        for statement in BINARY_SCHEMA:
+            db.execute(statement)
+    return path
 
 
 def _open_database(path, *, readonly=False):
@@ -185,10 +222,15 @@ def read_binary(*,owner,file_id):
     if not path.is_file() or path.stat().st_size>LIMIT+16:
         raise RuntimeError('Ciphertext unavailable')
     aad=_aad(owner,file_id,row['storage_id'],row['filename'])
-    dek=AESGCM(_kek()).decrypt(row['wrap_nonce'],row['wrapped_dek'],aad+b'|key')
-    data=AESGCM(dek).decrypt(row['nonce'],path.read_bytes(),aad+b'|file')
-    if len(data)!=row['size_bytes'] or hashlib.sha256(data).hexdigest()!=row['sha256']:
-        raise RuntimeError('Integrity verification failed')
+    try:
+        dek=AESGCM(_kek()).decrypt(row['wrap_nonce'],row['wrapped_dek'],aad+b'|key')
+        data=AESGCM(dek).decrypt(row['nonce'],path.read_bytes(),aad+b'|file')
+    except InvalidTag:
+        raise IntegrityVerificationError('Authenticated decryption failed') from None
+    if len(data)!=row['size_bytes']:
+        raise IntegrityVerificationError('Size verification failed')
+    # Constant-time comparison against the fingerprint recorded at upload.
+    verify_sha256(data,row['sha256'])
     return row,data
 
 
@@ -235,9 +277,11 @@ async def upload_file(request:Request,filename:str=Query(...),user=Depends(get_c
         total+=len(chunk)
         if total>LIMIT: raise HTTPException(413,'File exceeds 5 MiB limit')
         chunks.append(chunk)
-    try: return create_binary(owner=owner,filename=filename,body=b''.join(chunks))
+    try: result=create_binary(owner=owner,filename=filename,body=b''.join(chunks))
     except ValueError as exc: raise HTTPException(422,str(exc)) from None
     except Exception: raise HTTPException(503,'Encrypted storage temporarily unavailable') from None
+    audit_log.record_event('binary_upload',user_id=owner,detail={'binary_id':result['id'],'size_bytes':result['size_bytes']})
+    return result
 
 
 @API.get('/files/{file_id}/download')
@@ -246,9 +290,13 @@ def download_file(file_id:int,user=Depends(get_current_user)):
     if file_id<=0: raise HTTPException(404,'Document not found')
     try: row,data=read_binary(owner=owner,file_id=file_id)
     except LookupError: raise HTTPException(404,'Document not found') from None
+    except IntegrityVerificationError:
+        audit_log.record_event('integrity_failure',user_id=owner,outcome='failure',detail={'path':'binary','binary_id':file_id})
+        raise HTTPException(500,'Document failed integrity verification') from None
     except Exception: raise HTTPException(503,'Document recovery unavailable') from None
+    audit_log.record_event('binary_download',user_id=owner,detail={'binary_id':file_id})
     name=quote(row['filename'],safe='')
-    return Response(data,headers={'Content-Disposition':f"attachment; filename*=UTF-8''{name}", 'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'},media_type='application/octet-stream')
+    return Response(data,headers={'Content-Disposition':f"attachment; filename*=UTF-8''{name}", 'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','X-Content-SHA256':row['sha256']},media_type='application/octet-stream')
 
 
 @API.delete('/files/{file_id}')
@@ -258,4 +306,5 @@ def delete_file(file_id:int,user=Depends(get_current_user)):
     try: removed=delete_binary(owner=owner,file_id=file_id)
     except Exception: raise HTTPException(503,'Deletion requires operator review') from None
     if not removed: raise HTTPException(404,'Document not found')
+    audit_log.record_event('binary_delete',user_id=owner,detail={'binary_id':file_id})
     return {'deleted':True,'id':file_id}

@@ -7,6 +7,8 @@ from fastapi import (
     Request
 )
 
+from backend.app.security import audit_log
+
 from backend.app.security.encrypted_upload_preflight import (
     MAX_PRACTICE_UPLOAD_BYTES
 )
@@ -137,11 +139,26 @@ def create_encrypted_upload_router(
                 detail="Document not found"
             ) from None
 
-        except EncryptedUploadServiceError:
+        except EncryptedUploadServiceError as error:
+            audit_log.record_event(
+                "encrypted_upload_rejected",
+                user_id=authenticated_owner_id,
+                document_id=document_id,
+                outcome="failure",
+                db_path=db_path
+            )
             raise HTTPException(
                 status_code=400,
-                detail="Encrypted upload rejected"
+                detail=f"Encrypted upload rejected: {error}"
             ) from None
+
+        audit_log.record_event(
+            "encrypted_upload",
+            user_id=authenticated_owner_id,
+            document_id=document_id,
+            detail={"size_bytes": result["size_bytes"]},
+            db_path=db_path
+        )
 
         # Step 5: Return metadata only.
         # Never include plaintext or encryption keys.
@@ -150,6 +167,7 @@ def create_encrypted_upload_router(
             "document_id": result["document_id"],
             "storage_id": result["storage_id"],
             "size_bytes": result["size_bytes"],
+            "sha256": result["sha256"],
             "encrypted": True
         }
 

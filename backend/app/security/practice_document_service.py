@@ -13,7 +13,13 @@ from cryptography.hazmat.primitives.ciphers.aead import (
 
 from backend.app.database.encrypted_key_repository import (
     save_encrypted_key_record,
-    get_encrypted_key_record
+    get_encrypted_key_record,
+    record_content_sha256
+)
+
+from backend.app.security.integrity import (
+    sha256_hex,
+    verify_sha256
 )
 
 from backend.app.security.encrypted_storage import (
@@ -38,11 +44,13 @@ def _validate_filename(filename):
         raise ValueError("Unsafe practice filename")
 
 
-def _get_owned_filename(
+def _get_owned_metadata(
     db_path,
     document_id,
     owner_user_id
 ):
+    """Return (filename, metadata_sha256 or None) for an owned document."""
+
     # Ensure we never silently create a new database.
     if not Path(db_path).is_file():
         raise FileNotFoundError("Database not found")
@@ -51,9 +59,16 @@ def _get_owned_filename(
         sqlite3.connect(db_path)
     ) as connection:
 
+        has_sha256 = any(
+            column[1] == "sha256"
+            for column in connection.execute(
+                "PRAGMA table_info(owned_documents)"
+            )
+        )
+
         row = connection.execute(
-            """
-            SELECT filename
+            f"""
+            SELECT filename, {"sha256" if has_sha256 else "NULL"}
             FROM owned_documents
             WHERE id = ?
               AND owner_user_id = ?
@@ -64,7 +79,11 @@ def _get_owned_filename(
     if row is None:
         raise LookupError("Owned document not found")
 
-    return row[0]
+    return row[0], row[1]
+
+
+def _get_owned_filename(db_path, document_id, owner_user_id):
+    return _get_owned_metadata(db_path, document_id, owner_user_id)[0]
 
 
 def _aad(kind, owner_id, document_id, storage_id,
@@ -122,7 +141,7 @@ def save_practice_document(
         raise ValueError("Trusted storage folder missing")
 
     # Confirm ownership and the canonical filename.
-    actual_filename = _get_owned_filename(
+    actual_filename, metadata_sha256 = _get_owned_metadata(
         db_path,
         document_id,
         owner_user_id
@@ -130,6 +149,14 @@ def save_practice_document(
 
     if filename != actual_filename:
         raise ValueError("Filename does not match document")
+
+    # The fingerprint shown in the metadata must describe exactly
+    # the bytes being encrypted, otherwise later verification is
+    # meaningless.
+    content_sha256 = sha256_hex(plaintext)
+
+    if metadata_sha256 and metadata_sha256.lower() != content_sha256:
+        raise ValueError("Content does not match document SHA-256")
 
     # Random file ID. Never use the original filename
     # as the encrypted storage filename.
@@ -185,7 +212,8 @@ def save_practice_document(
             key_id=key_id,
             wrap_nonce=wrap_nonce,
             wrapped_dek=wrapped_dek,
-            db_path=db_path
+            db_path=db_path,
+            content_sha256=content_sha256
         )
 
     except Exception:
@@ -281,5 +309,27 @@ def read_practice_document(
             filename
         )
     )
+
+    # Independent end-to-end check against the fingerprint
+    # recorded at upload time (constant-time comparison).
+    expected = record.get("content_sha256")
+
+    if expected:
+        verify_sha256(plaintext, expected)
+    else:
+        # Row written before migration 004. GCM has just
+        # authenticated it; record its fingerprint now so all
+        # later downloads are verified (trust on first use).
+        actual = sha256_hex(plaintext)
+        try:
+            record_content_sha256(
+                document_id,
+                owner_user_id,
+                actual,
+                db_path=db_path
+            )
+        except Exception:
+            # Recording is best effort; never block a valid read.
+            pass
 
     return plaintext

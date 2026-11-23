@@ -12,6 +12,8 @@ from backend.app.security.persistent_practice_vault import (
     save_document_with_dpapi
 )
 
+from backend.app.security.integrity import sha256_hex
+
 
 class EncryptedUploadServiceError(Exception):
     """Encrypted upload preparation or storage failed."""
@@ -187,6 +189,15 @@ def store_encrypted_upload(
             key_id=key_id
         )
 
+    except ValueError as error:
+        if "SHA-256" in str(error):
+            raise EncryptedUploadServiceError(
+                "Content does not match the document's SHA-256 metadata"
+            ) from None
+        raise EncryptedUploadServiceError(
+            "Encrypted upload storage failed"
+        ) from None
+
     except Exception:
         raise EncryptedUploadServiceError(
             "Encrypted upload storage failed"
@@ -199,6 +210,7 @@ def store_encrypted_upload(
         "owner_user_id": authenticated_owner_id,
         "filename": summary["filename"],
         "size_bytes": summary["size_bytes"],
+        "sha256": sha256_hex(content),
         "storage_id": storage_id,
         "encrypted": True
     }

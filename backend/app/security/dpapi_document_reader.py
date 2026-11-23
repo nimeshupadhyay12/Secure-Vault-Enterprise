@@ -1,6 +1,8 @@
 
 from pathlib import Path
 
+from cryptography.exceptions import InvalidTag
+
 from backend.app.database.encrypted_key_repository import (
     get_encrypted_key_record
 )
@@ -18,8 +20,17 @@ from backend.app.security.practice_document_service import (
 )
 
 
+from backend.app.security.integrity import (
+    IntegrityVerificationError
+)
+
+
 class DocumentRecoveryError(Exception):
     """Generic error for document recovery failures."""
+
+
+class DocumentIntegrityError(DocumentRecoveryError):
+    """Ciphertext, wrapped key, context or SHA-256 check failed."""
 
 
 def read_document_with_dpapi(
@@ -90,6 +101,13 @@ def read_document_with_dpapi(
         )
 
         return plaintext
+
+    except (IntegrityVerificationError, InvalidTag):
+        # AES-GCM tag failure (modified ciphertext, wrapped key or
+        # authenticated context) or SHA-256 fingerprint mismatch.
+        raise DocumentIntegrityError(
+            "Document failed integrity verification"
+        ) from None
 
     except Exception:
         # Do not expose internal key-store,
